@@ -480,7 +480,12 @@ func (gw *Gateway) cmdNew(thread int, arg string) {
 		gw.showDirs(thread, gw.cfg.DefaultCwd, "newdir", agent, name, 0)
 		return
 	}
-	gw.startSession(thread, agent, resolvePath(gw.cfg.DefaultCwd, path), name, 0)
+	dir := resolvePath(gw.cfg.DefaultCwd, path)
+	if name == "" {
+		gw.askTopicName(thread, 0, agent, dir)
+		return
+	}
+	gw.startSession(thread, agent, dir, name, 0)
 }
 
 func parseNewArgs(arg string) (agent, path, name string) {
@@ -557,6 +562,29 @@ func (gw *Gateway) notify(thread, editMsg int, text string, kb ...*Keyboard) {
 		}
 	}
 	gw.reply(thread, text, k)
+}
+
+// askTopicName is the last step of creating a session: what the topic should
+// be called. The agent goes in front of whatever you pick, so "VPN App"
+// becomes "Claude • VPN App".
+func (gw *Gateway) askTopicName(thread, editMsg int, agent, cwd string) {
+	suggestion := filepath.Base(strings.TrimRight(cwd, "/"))
+	kb := Rows(
+		[]Button{{Text: "⌨️ Type a name", CallbackData: "newname:type"}},
+		[]Button{{Text: "📁 " + truncate(suggestion, 30), CallbackData: "newname:auto"}},
+	)
+	title := "What should this topic be called?\n<i>" +
+		html.EscapeString(topicTitle(agent, "your name here")) + "</i>"
+	menu := &pending{kind: "newname", agent: agent, dirs: []string{cwd}, threadID: thread}
+	if editMsg > 0 {
+		gw.rememberMenu(editMsg, menu)
+		if err := gw.tg.Edit(gw.ctx, gw.cfg.ChatID, editMsg, title, kb); err == nil {
+			return
+		}
+	}
+	if m := gw.reply(thread, title, kb); m != nil {
+		gw.rememberMenu(m.MessageID, menu)
+	}
 }
 
 // ---------------------------------------------------------------- pickers
@@ -806,7 +834,17 @@ func (gw *Gateway) setCwd(thread int, sess *Session, arg string) {
 func (gw *Gateway) finishPathEntry(p *pending, text string, thread int) {
 	switch p.kind {
 	case "newdir":
-		gw.startSession(p.threadID, p.agent, resolvePath(gw.cfg.DefaultCwd, text), p.name, 0)
+		dir := resolvePath(gw.cfg.DefaultCwd, text)
+		if p.name == "" {
+			gw.askTopicName(p.threadID, 0, p.agent, dir)
+			return
+		}
+		gw.startSession(p.threadID, p.agent, dir, p.name, 0)
+	case "newname":
+		if len(p.dirs) == 0 {
+			return
+		}
+		gw.startSession(p.threadID, p.agent, p.dirs[0], text, 0)
 	case "cd":
 		sess := gw.store.Get(p.threadID)
 		if sess == nil {
@@ -887,6 +925,10 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 			ack("")
 			dir := p.dirs[len(p.dirs)-1]
 			if head == "newdir" {
+				if p.name == "" {
+					gw.askTopicName(p.threadID, msgID, p.agent, dir)
+					return
+				}
 				gw.startSession(p.threadID, p.agent, dir, p.name, msgID)
 			} else if sess != nil {
 				gw.setCwd(thread, sess, dir)
@@ -905,6 +947,21 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 			ack("")
 			gw.showDirs(thread, p.dirs[i], head, p.agent, p.name, msgID)
 		}
+
+	case "newname":
+		p := gw.menu(msgID)
+		if p == nil || len(p.dirs) == 0 {
+			ack("That menu expired.")
+			return
+		}
+		if arg == "type" {
+			ack("Send me the name")
+			gw.awaitPath(cq.From.ID, &pending{kind: "newname", agent: p.agent, dirs: p.dirs, threadID: p.threadID})
+			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, "Send the name for this topic as a message.", nil)
+			return
+		}
+		ack("")
+		gw.startSession(p.threadID, p.agent, p.dirs[0], "", msgID)
 
 	case "bind":
 		ack("")

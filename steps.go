@@ -128,6 +128,8 @@ func describeStep(tool, detail string) (icon, phrase string) {
 		return "🤝", "Asking a subagent"
 	case "TodoWrite", "todo":
 		return "📋", "Planning the work"
+	case "todo-item":
+		return "📋", truncate(strings.TrimSpace(detail), 90)
 	case "KillShell", "BashOutput":
 		return "📊", "Checking a background job"
 	}

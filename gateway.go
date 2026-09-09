@@ -364,11 +364,11 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string) {
 				turn.SetFileStep(ev.Kind, ev.Path)
 				turn.Flush(false)
 			case "todo":
-				// The plan is a step, not a permanent note: show the item the
-				// agent is on rather than the whole checklist every time.
+				// The agent's own plan already reads as a checklist; only the
+				// item it just started is worth a line of its own.
 				for _, it := range ev.Items {
 					if !it.Done {
-						turn.step = "📋 <i>" + html.EscapeString(truncate(it.Text, 90)) + "…</i>"
+						turn.SetStep("start", "todo-item", truncate(it.Text, 90))
 						break
 					}
 				}

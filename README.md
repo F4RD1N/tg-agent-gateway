@@ -20,10 +20,10 @@ does kill everything that session started.
 
 ## What it does
 
-- **A topic per session.** `/new` in General creates the topic, names it and
-  starts the agent. Ask for a name and the topic becomes "Claude • VPN App";
-  the agent stays in front when you rename it or switch agents. Send a
-  message in a topic and it goes to that session.
+- **A topic per session.** `/new` in General asks for the agent, the folder
+  and what to call the topic, all on buttons, then creates it. The name you
+  give becomes "Claude • VPN App"; the agent stays in front when you rename
+  it or switch agents. Send a message in a topic and it goes to that session.
 - **Both agents, full access.** Claude Code runs with `bypassPermissions`,
   Codex with `danger-full-access` and no approval prompts. Switch a topic
   between them with a button.
@@ -36,10 +36,16 @@ does kill everything that session started.
   and whether `~/.claude/settings.json` is loaded; for Codex the sandbox,
   approval policy, web search and network access.
 - **Live answers, the way app builders show them.** The reply is one message
-  that is edited as it streams: the agent's own words, and under them a single
-  line for what it is doing now - "Installing dependencies", "Running tests",
-  "Editing app/main.go". Steps replace each other instead of piling up, and
-  command output is not shown at all unless Details are on, because a wall of
+  edited as it streams: the agent's words, and a checklist of what it did.
+
+  ```
+  ✔️ Installing dependencies
+  ✔️ Running tests
+  ▫️ Editing js/app.js
+  ```
+
+  Finished steps keep their tick, only the last one is live, and the command
+  and its output are not shown at all unless Details are on, because a wall of
   log hides the answer on a phone. **Stop** ends the turn but leaves it
   resumable; **Kill** takes down the agent process and every command it
   started.

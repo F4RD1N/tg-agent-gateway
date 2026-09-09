@@ -273,8 +273,14 @@ func TestNewSessionFlowIsAllButtons(t *testing.T) {
 		t.Fatalf("folder picker should list sub-folders as buttons, got %v", db)
 	}
 
-	// "use this folder" creates the topic and the session.
+	// "use this folder" now asks what the topic should be called.
 	gw.handleUpdate(press(0, menuID, "newdir:here"))
+	nameAsk := f.waitFor(t, "editMessageText", "What should this topic be called?", 3*time.Second)
+	nb := buttons(nameAsk)
+	if !has(nb, "newname:type") || !has(nb, "newname:auto") {
+		t.Fatalf("the name step needs both buttons, got %v", nb)
+	}
+	gw.handleUpdate(press(0, menuID, "newname:auto"))
 	f.waitFor(t, "createForumTopic", "", 3*time.Second)
 	var sess *Session
 	deadline := time.Now().Add(3 * time.Second)
@@ -805,6 +811,32 @@ func TestRenameKeepsTheAgentPrefix(t *testing.T) {
 	}
 }
 
+// Creating a session asks for a name, and a typed name lands on the topic
+// behind the agent.
+func TestSessionCreationAsksForAName(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.handleUpdate(msg(0, "/new claude "+work))
+	c := f.waitFor(t, "sendMessage", "What should this topic be called?", 3*time.Second)
+	if !has(buttons(c), "newname:type") {
+		t.Fatalf("expected the name question, got %v", buttons(c))
+	}
+	gw.handleUpdate(press(0, 1001, "newname:type"))
+	f.waitFor(t, "editMessageText", "Send the name", 3*time.Second)
+	gw.handleUpdate(msg(0, "VPN App"))
+	created := f.waitFor(t, "createForumTopic", "", 5*time.Second)
+	if name, _ := created.Params["name"].(string); name != "Claude • VPN App" {
+		t.Fatalf("topic name = %q, want %q", name, "Claude • VPN App")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := gw.store.Get(555); s != nil && s.Name == "VPN App" && !s.AutoName {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("session name was not stored: %+v", gw.store.Get(555))
+}
+
 func TestParseNewArgs(t *testing.T) {
 	cases := []struct{ in, agent, path, name string }{
 		{"", "", "", ""},
@@ -1028,8 +1060,8 @@ func TestCleanCommand(t *testing.T) {
 	}
 }
 
-// Steps replace each other; they never pile up.
-func TestStepsReplaceRatherThanAccumulate(t *testing.T) {
+// Finished steps stay on screen with a tick; only the last one is live.
+func TestStepChecklist(t *testing.T) {
 	gw, _, work := newTestGateway(t)
 	sess := &Session{ThreadID: 71, Agent: "claude", Cwd: work}
 	turn := gw.NewTurn(sess)
@@ -1037,22 +1069,49 @@ func TestStepsReplaceRatherThanAccumulate(t *testing.T) {
 	turn.SetStep("ok", "Bash", "added 120 packages")
 	turn.SetStep("start", "Bash", `/bin/bash -lc "npm test"`)
 	body := turn.render()
-	if strings.Count(body, "<i>") != 1 {
-		t.Fatalf("expected exactly one step line, got %q", body)
+	if !strings.Contains(body, markDone+" Installing dependencies") {
+		t.Errorf("a finished step should keep its place with a tick: %q", body)
 	}
-	if !strings.Contains(body, "Running tests") {
-		t.Fatalf("the current step should be the newest one, got %q", body)
+	if !strings.Contains(body, markRunning+" Running tests") {
+		t.Errorf("the live step should be marked as running: %q", body)
 	}
-	if strings.Contains(body, "Installing") {
-		t.Fatalf("an older step is still on screen: %q", body)
+	// A failure is marked, and does not stop later steps.
+	turn.SetStep("fail", "Bash", "exit status 1")
+	turn.SetStep("start", "Bash", `/bin/bash -lc "go build ./..."`)
+	body = turn.render()
+	if !strings.Contains(body, markFailed+" Running tests") {
+		t.Errorf("a failed step should be marked: %q", body)
 	}
-	// Words from the agent clear the step line.
-	turn.AddText("Done, the tests pass.")
-	if strings.Contains(turn.render(), "Running tests") {
-		t.Fatalf("the step should clear once the agent speaks: %q", turn.render())
+	if strings.Count(body, markDone) != 1 || strings.Count(body, markRunning) != 1 {
+		t.Errorf("expected one done and one running mark: %q", body)
 	}
-	turn.running = false
-	if strings.Contains(turn.render(), "<i>") {
-		t.Fatalf("a finished turn should carry no step line: %q", turn.render())
+	// Finishing closes whatever is still open.
+	turn.Finish("")
+	if strings.Contains(turn.render(), markRunning) {
+		t.Errorf("a finished turn leaves nothing running: %q", turn.render())
+	}
+	// The agent's own words sit above the steps that follow them.
+	turn2 := gw.NewTurn(sess)
+	turn2.AddText("I will set the project up.")
+	turn2.SetStep("start", "Bash", `/bin/bash -lc "mkdir -p app"`)
+	if got := turn2.render(); !strings.HasPrefix(got, "I will set the project up.") {
+		t.Errorf("text should come before the steps it introduces: %q", got)
+	}
+}
+
+// A very long turn keeps the checklist bounded.
+func TestChecklistIsBounded(t *testing.T) {
+	gw, _, work := newTestGateway(t)
+	turn := gw.NewTurn(&Session{ThreadID: 72, Agent: "claude", Cwd: work})
+	for i := 0; i < maxVisibleSteps+8; i++ {
+		turn.SetStep("start", "Bash", `/bin/bash -lc "go test ./..."`)
+		turn.SetStep("ok", "Bash", "ok")
+	}
+	body := turn.render()
+	if n := strings.Count(body, markDone); n > maxVisibleSteps {
+		t.Errorf("checklist shows %d steps, more than the %d cap", n, maxVisibleSteps)
+	}
+	if !strings.Contains(body, "earlier steps") {
+		t.Errorf("the trimmed steps should be counted: %q", truncate(body, 200))
 	}
 }
