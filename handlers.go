@@ -1199,11 +1199,12 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 	case "look":
 		p := gw.menu(msgID)
 		if p == nil || sess == nil || len(p.dirs) == 0 {
-			ack("")
+			ack("That message is too old; send the file again.")
 			return
 		}
 		ack("")
-		gw.submit(sess, "Look at the file I just uploaded: "+p.dirs[0])
+		_ = gw.tg.EditKeyboard(gw.ctx, gw.cfg.ChatID, msgID, nil)
+		gw.submitWithFiles(sess, "Look at this and tell me what you see.", p.dirs)
 
 	default:
 		ack("")

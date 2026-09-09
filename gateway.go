@@ -49,7 +49,18 @@ type Gateway struct {
 	menus    map[int]*pending
 	awaitTP  map[int64]*pending // user id -> "send me a path" state
 	modelsBy map[string]modelCacheEntry
+	albums   map[string]*album
 	reqSeq   int64
+}
+
+// album collects the photos of one Telegram media group: they arrive as
+// separate messages, usually with the caption on only one of them, so they are
+// held briefly and handed to the agent together.
+type album struct {
+	paths   []string
+	caption string
+	thread  int
+	timer   *time.Timer
 }
 
 func NewGateway(ctx context.Context, cfg *Config, store *Store) *Gateway {
@@ -59,6 +70,7 @@ func NewGateway(ctx context.Context, cfg *Config, store *Store) *Gateway {
 		turns: map[int]*Turn{}, running: map[int]bool{},
 		menus: map[int]*pending{}, awaitTP: map[int64]*pending{},
 		modelsBy: map[string]modelCacheEntry{},
+		albums:   map[string]*album{},
 	}
 }
 
@@ -246,7 +258,47 @@ func (gw *Gateway) reply(thread int, text string, kb *Keyboard) *TGMessage {
 
 var errBusy = fmt.Errorf("busy")
 
+// submitWithFiles sends a prompt that has files attached to it. Images are
+// named for the agent and, where the agent supports it, handed over as image
+// input rather than a path.
+func (gw *Gateway) submitWithFiles(sess *Session, caption string, paths []string) {
+	var images, others []string
+	for _, p := range paths {
+		if isImage(p) {
+			images = append(images, p)
+		} else {
+			others = append(others, p)
+		}
+	}
+	var b strings.Builder
+	if caption != "" {
+		b.WriteString(caption)
+	} else if len(images) > 0 {
+		b.WriteString("Look at this and tell me what you see.")
+	}
+	// Images are handed to the agent as images; other files only need naming.
+	for _, p := range others {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString("Attached file: " + p)
+	}
+	gw.submitPrompt(sess, strings.TrimSpace(b.String()), images)
+}
+
+func isImage(p string) bool {
+	switch strings.ToLower(filepath.Ext(p)) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif":
+		return true
+	}
+	return false
+}
+
 func (gw *Gateway) submit(sess *Session, text string) {
+	gw.submitPrompt(sess, text, nil)
+}
+
+func (gw *Gateway) submitPrompt(sess *Session, text string, images []string) {
 	gw.mu.Lock()
 	busy := gw.running[sess.ThreadID]
 	gw.mu.Unlock()
@@ -265,7 +317,7 @@ func (gw *Gateway) submit(sess *Session, text string) {
 	turn := gw.NewTurn(sess)
 	gw.turns[sess.ThreadID] = turn
 	gw.mu.Unlock()
-	go gw.pump(sess, turn, text)
+	go gw.pump(sess, turn, text, images)
 }
 
 // sessionPreamble is prepended to the first message of a conversation so the
@@ -279,7 +331,7 @@ func sessionPreamble(sess *Session) string {
 		"Keep your replies short and readable: they are being read on a phone.\n\n"
 }
 
-func (gw *Gateway) pump(sess *Session, turn *Turn, text string) {
+func (gw *Gateway) pump(sess *Session, turn *Turn, text string, images []string) {
 	sid := sidOf(sess.ThreadID)
 	ch := gw.bridge.Subscribe(sid)
 	defer func() {
@@ -295,7 +347,9 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string) {
 	if sess.Ref == "" && !strings.HasPrefix(text, "/") {
 		text = sessionPreamble(sess) + text
 	}
-	err := gw.bridge.Send(gw.command("prompt", sess, text))
+	cmd := gw.command("prompt", sess, text)
+	cmd.Images = images
+	err := gw.bridge.Send(cmd)
 	if err != nil {
 		turn.AddNote("⚠️ " + html.EscapeString(err.Error()))
 		turn.Finish("")
@@ -545,11 +599,12 @@ func (gw *Gateway) handleUpload(m *TGMessage, thread int) {
 		dir = sess.Cwd
 	}
 	var fileID, name string
-	if m.Document != nil {
+	switch {
+	case m.Document != nil:
 		fileID, name = m.Document.FileID, m.Document.FileName
-	} else if len(m.Photo) > 0 {
-		best := m.Photo[len(m.Photo)-1]
-		fileID = best.FileID
+	case len(m.Photo) > 0:
+		// The last size is the largest one Telegram kept.
+		fileID = m.Photo[len(m.Photo)-1].FileID
 		name = fmt.Sprintf("photo_%d.jpg", m.MessageID)
 	}
 	if fileID == "" {
@@ -561,17 +616,68 @@ func (gw *Gateway) handleUpload(m *TGMessage, thread int) {
 		return
 	}
 	caption := strings.TrimSpace(m.Caption)
-	text := "📎 saved to <code>" + html.EscapeString(path) + "</code>"
-	if sess != nil && caption != "" {
-		gw.reply(thread, text, nil)
-		gw.submit(sess, caption+"\n\n(the file is at "+path+")")
+
+	// An album arrives as several messages, and usually only one of them
+	// carries the caption, so they are collected before the agent is asked.
+	if m.MediaGroupID != "" && sess != nil {
+		gw.collectAlbum(m.MediaGroupID, thread, path, caption)
 		return
 	}
-	kb := (*Keyboard)(nil)
-	if sess != nil {
-		kb = Rows([]Button{{Text: "👀 Ask the agent to look at it", CallbackData: "look"}})
+
+	if sess == nil {
+		gw.reply(thread, "📎 saved to <code>"+html.EscapeString(path)+"</code>", nil)
+		return
 	}
-	gw.reply(thread, text, kb)
+	if caption != "" {
+		gw.reply(thread, "📎 <code>"+html.EscapeString(path)+"</code>", nil)
+		gw.submitWithFiles(sess, caption, []string{path})
+		return
+	}
+	msg := gw.reply(thread, "📎 saved to <code>"+html.EscapeString(path)+"</code>", Rows(
+		[]Button{{Text: "👀 Ask the agent to look at it", CallbackData: "look"}},
+	))
+	if msg != nil {
+		gw.rememberMenu(msg.MessageID, &pending{kind: "look", dirs: []string{path}, threadID: thread})
+	}
+}
+
+// collectAlbum holds the photos of one media group for a moment, then sends
+// them to the agent as a single message.
+func (gw *Gateway) collectAlbum(groupID string, thread int, path, caption string) {
+	gw.mu.Lock()
+	a := gw.albums[groupID]
+	if a == nil {
+		a = &album{thread: thread}
+		gw.albums[groupID] = a
+	}
+	a.paths = append(a.paths, path)
+	if caption != "" {
+		a.caption = caption
+	}
+	if a.timer != nil {
+		a.timer.Stop()
+	}
+	a.timer = time.AfterFunc(1500*time.Millisecond, func() { gw.flushAlbum(groupID) })
+	gw.mu.Unlock()
+}
+
+func (gw *Gateway) flushAlbum(groupID string) {
+	gw.mu.Lock()
+	a := gw.albums[groupID]
+	delete(gw.albums, groupID)
+	gw.mu.Unlock()
+	if a == nil || len(a.paths) == 0 {
+		return
+	}
+	sess := gw.store.Get(a.thread)
+	if sess == nil {
+		return
+	}
+	gw.reply(a.thread, fmt.Sprintf("📎 saved %d files to <code>%s</code>", len(a.paths), html.EscapeString(sess.Cwd)), nil)
+	if a.caption == "" {
+		a.caption = "Look at these files."
+	}
+	gw.submitWithFiles(sess, a.caption, a.paths)
 }
 
 // ---------------------------------------------------------------- shell

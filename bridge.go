@@ -63,14 +63,15 @@ type Event struct {
 
 // Command is one line written to the bridge.
 type Command struct {
-	Type   string `json:"type"`
-	SID    string `json:"sid,omitempty"`
-	Agent  string `json:"agent,omitempty"`
-	Cwd    string `json:"cwd,omitempty"`
-	Model  string `json:"model,omitempty"`
-	Effort string `json:"effort,omitempty"`
-	Resume string `json:"resume,omitempty"`
-	Text   string `json:"text,omitempty"`
+	Type   string   `json:"type"`
+	SID    string   `json:"sid,omitempty"`
+	Agent  string   `json:"agent,omitempty"`
+	Cwd    string   `json:"cwd,omitempty"`
+	Model  string   `json:"model,omitempty"`
+	Effort string   `json:"effort,omitempty"`
+	Resume string   `json:"resume,omitempty"`
+	Text   string   `json:"text,omitempty"`
+	Images []string `json:"images,omitempty"`
 
 	PermMode     string  `json:"perm_mode,omitempty"`
 	Thinking     int     `json:"thinking,omitempty"`

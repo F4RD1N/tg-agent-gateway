@@ -56,6 +56,7 @@ type TGMessage struct {
 	Date            int64         `json:"date"`
 	Text            string        `json:"text"`
 	Caption         string        `json:"caption"`
+	MediaGroupID    string        `json:"media_group_id"`
 	Document        *TGDocument   `json:"document"`
 	Photo           []TGPhotoSize `json:"photo"`
 	ForumTopic      *struct {

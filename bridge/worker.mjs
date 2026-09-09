@@ -77,7 +77,7 @@ function clip(str, n = 400) {
 
 // ---------------------------------------------------------------- claude
 
-async function runClaude(s, text) {
+async function runClaude(s, text, images) {
   const ac = new AbortController();
   s.abort = () => ac.abort();
   const mode = s.permMode || 'bypassPermissions';
@@ -105,7 +105,15 @@ async function runClaude(s, text) {
   const toolNames = new Map();
   let sawText = false;
 
-  const q = query({ prompt: text, options: opts });
+  let prompt = text;
+  if (images && images.length) {
+    // Claude Code views images with its Read tool; saying so plainly stops it
+    // trying to cat the file first.
+    const list = images.join('\n');
+    prompt = text + '\n\nAttached image' + (images.length > 1 ? 's' : '') + ':\n' + list +
+      '\nOpen ' + (images.length > 1 ? 'them' : 'it') + ' with the Read tool (not Bash) before answering.';
+  }
+  const q = query({ prompt, options: opts });
   for await (const m of q) {
     switch (m.type) {
       case 'system':
@@ -201,7 +209,7 @@ function describeClaudeTool(name, input) {
 
 // ---------------------------------------------------------------- codex
 
-async function runCodex(s, text) {
+async function runCodex(s, text, images) {
   const ac = new AbortController();
   s.abort = () => ac.abort();
   const threadOpts = {
@@ -217,7 +225,13 @@ async function runCodex(s, text) {
 
   const codex = getCodex();
   const thread = s.ref ? codex.resumeThread(s.ref, threadOpts) : codex.startThread(threadOpts);
-  const started = await thread.runStreamed(text, { signal: ac.signal });
+  // Codex takes images as input directly, which is far better than telling it
+  // where a file is and hoping it opens it.
+  let input = text;
+  if (images && images.length) {
+    input = [{ type: 'text', text }, ...images.map(path => ({ type: 'local_image', path }))];
+  }
+  const started = await thread.runStreamed(input, { signal: ac.signal });
   let usage = null;
   const t0 = Date.now();
 
@@ -300,10 +314,10 @@ async function pump() {
   if (s.running) return;
   s.running = true;
   while (s.queue.length) {
-    const text = s.queue.shift();
+    const { text, images } = s.queue.shift();
     try {
-      if (s.agent === 'codex') await runCodex(s, text);
-      else await runClaude(s, text);
+      if (s.agent === 'codex') await runCodex(s, text, images);
+      else await runClaude(s, text, images);
     } catch (err) {
       const msg = String(err?.message || err);
       const aborted = /abort/i.test(msg);
@@ -341,7 +355,7 @@ rl.on('line', line => {
         if (msg.effort !== undefined) s.effort = msg.effort || '';
         if (msg.resume !== undefined) s.ref = msg.resume || '';
         applyConfig(s, msg);
-        s.queue.push(String(msg.text || ''));
+        s.queue.push({ text: String(msg.text || ''), images: Array.isArray(msg.images) ? msg.images : [] });
         if (s.running) out({ type: 'busy', sid: s.sid, queued: s.queue.length });
         pump();
         break;

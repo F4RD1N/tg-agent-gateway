@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -60,6 +61,10 @@ func newFakeTG(t *testing.T) *fakeTG {
 				"message_id": id, "message_thread_id": thread, "chat": map[string]any{"id": -100123},
 			}}
 			_ = json.NewEncoder(w).Encode(resp)
+		case "getFile":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": map[string]any{
+				"file_path": "photos/upload.jpg", "file_size": 11,
+			}})
 		case "createForumTopic":
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": map[string]any{
 				"message_thread_id": 555, "name": params["name"],
@@ -67,6 +72,9 @@ func newFakeTG(t *testing.T) *fakeTG {
 		default:
 			io.WriteString(w, `{"ok":true,"result":true}`)
 		}
+	})
+	mux.HandleFunc("/file/", func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "PRETEND-JPEG")
 	})
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
@@ -925,20 +933,70 @@ func TestCdBrowsesWithButtons(t *testing.T) {
 	t.Fatalf("cwd not changed: %+v", gw.store.Get(12))
 }
 
-func TestUploadLandsInTheSessionFolder(t *testing.T) {
+// A photo with a caption is saved into the session's folder and the caption
+// becomes the prompt, with the image handed to the agent.
+func TestPhotoWithCaptionReachesTheAgent(t *testing.T) {
 	gw, f, work := newTestGateway(t)
-	gw.store.Put(&Session{ThreadID: 13, Agent: "claude", Cwd: work, Created: time.Now(), LastUsed: time.Now()})
-	// The fake API returns ok:true for getFile without a path, so the upload
-	// fails cleanly; what matters is that it is reported, not swallowed.
+	gw.store.Put(&Session{ThreadID: 13, Agent: "codex", Cwd: work, Created: time.Now(), LastUsed: time.Now()})
+
 	u := msg(13, "")
-	u.Message.Document = &TGDocument{FileID: "abc", FileName: "notes.txt"}
+	u.Message.Photo = []TGPhotoSize{{FileID: "small", Width: 90}, {FileID: "big", Width: 1280}}
+	u.Message.Caption = "make the button in this screenshot green"
 	gw.handleUpdate(u)
-	f.waitFor(t, "sendMessage", "file", 3*time.Second)
-	_ = work
+
+	f.waitFor(t, "sendMessage", "photo_1.jpg", 5*time.Second)
+	saved := filepath.Join(work, "photo_1.jpg")
+	if _, err := os.Stat(saved); err != nil {
+		t.Fatalf("the photo was not saved: %v", err)
+	}
+	// The turn runs, which means the caption went to the agent.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := gw.store.Get(13); s != nil && s.Turns == 1 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("the caption never reached the agent")
 }
 
-// ---------- rendering ----------
+// Several photos sent as one album become one message to the agent.
+func TestPhotoAlbumIsSentOnce(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.store.Put(&Session{ThreadID: 15, Agent: "codex", Cwd: work, Created: time.Now(), LastUsed: time.Now()})
 
+	for i, caption := range []string{"compare these two", ""} {
+		u := msg(15, "")
+		u.Message.MessageID = 40 + i
+		u.Message.Photo = []TGPhotoSize{{FileID: fmt.Sprintf("f%d", i), Width: 1280}}
+		u.Message.Caption = caption
+		u.Message.MediaGroupID = "album-1"
+		gw.handleUpdate(u)
+	}
+	f.waitFor(t, "sendMessage", "saved 2 files", 6*time.Second)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := gw.store.Get(15); s != nil && s.Turns == 1 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("an album should produce exactly one turn, got %+v", gw.store.Get(15))
+}
+
+// Images go to the agent as images; other files are only named.
+func TestImageDetection(t *testing.T) {
+	for _, p := range []string{"/a/b.png", "/a/b.JPG", "/x/y.jpeg", "/x/y.webp", "/x/y.HEIC"} {
+		if !isImage(p) {
+			t.Errorf("%s should count as an image", p)
+		}
+	}
+	for _, p := range []string{"/a/b.zip", "/a/b.txt", "/a/b.apk", "/a/b"} {
+		if isImage(p) {
+			t.Errorf("%s should not count as an image", p)
+		}
+	}
+}
 func TestMarkdownToHTML(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"plain", "plain"},
