@@ -28,6 +28,7 @@ Each topic in this group is one agent session. Write a message in a topic and it
 /get &lt;file&gt; — send me a file
 /run &lt;command&gt; — run a shell command here
 /stop — interrupt the current turn
+/kill — kill the agent and everything it started
 /clear — forget the conversation, keep the topic
 /status — what this session is
 /verbose — show tool output and thinking
@@ -51,6 +52,8 @@ func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 		gw.cmdSessions(thread)
 	case "stop":
 		gw.cmdStop(thread)
+	case "kill":
+		gw.needSession(thread, sess, func(s *Session) { gw.cmdKill(thread) })
 	case "status":
 		if sess == nil {
 			gw.offerBind(thread, "No session here.")
@@ -696,6 +699,21 @@ func (gw *Gateway) cmdSessions(thread int) {
 	gw.reply(thread, b.String(), kb)
 }
 
+// cmdKill is the hard stop: it takes down the agent process for this topic
+// and every command it started, which /stop deliberately does not do.
+func (gw *Gateway) cmdKill(thread int) {
+	if err := gw.bridge.Send(Command{Type: "kill", SID: sidOf(thread)}); err != nil {
+		gw.reply(thread, "⚠️ "+html.EscapeString(err.Error()), nil)
+		return
+	}
+	gw.mu.Lock()
+	running := gw.running[thread]
+	gw.mu.Unlock()
+	if !running {
+		gw.reply(thread, "💀 killed anything this session had running.", nil)
+	}
+}
+
 func (gw *Gateway) cmdStop(thread int) {
 	gw.mu.Lock()
 	running := gw.running[thread]
@@ -845,6 +863,14 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 		}
 		ack("Stopping…")
 		_ = gw.bridge.Send(Command{Type: "interrupt", SID: sidOf(thread)})
+
+	case "kill":
+		if sess == nil {
+			ack("No session.")
+			return
+		}
+		ack("Killing the processes…")
+		gw.cmdKill(thread)
 
 	case "model":
 		if sess == nil {

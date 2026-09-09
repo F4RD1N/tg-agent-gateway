@@ -350,6 +350,82 @@ func TestStopButtonInterrupts(t *testing.T) {
 
 // The picker shows the agent's own list, and choosing a model then offers
 // that model's effort levels as a second screen of buttons.
+// Every keyboard this bot sends must be at most two buttons wide: three
+// across clips the labels on a phone.
+func TestNoKeyboardIsWiderThanTwo(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.store.Put(&Session{ThreadID: 61, Agent: "codex", Cwd: work, Created: time.Now(), LastUsed: time.Now()})
+	for _, cmd := range []string{"/help", "/status", "/config", "/cd", "/end", "/sessions", "/new"} {
+		gw.handleUpdate(msg(61, cmd))
+	}
+	gw.handleUpdate(msg(61, "/model"))
+	time.Sleep(1500 * time.Millisecond)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	seen := 0
+	for _, c := range f.calls {
+		rm, ok := c.Params["reply_markup"].(map[string]any)
+		if !ok {
+			continue
+		}
+		rows, _ := rm["inline_keyboard"].([]any)
+		for _, row := range rows {
+			seen++
+			if n := len(row.([]any)); n > 2 {
+				t.Errorf("%s sent a row of %d buttons", c.Method, n)
+			}
+		}
+	}
+	if seen < 8 {
+		t.Fatalf("expected to inspect several keyboards, saw %d rows", seen)
+	}
+}
+
+// A short message would squeeze the buttons, so it is padded out.
+func TestShortMessagesArePaddedForButtons(t *testing.T) {
+	gw, f, _ := newTestGateway(t)
+	gw.handleUpdate(msg(0, "/new"))
+	c := f.waitFor(t, "sendMessage", "Which agent?", 3*time.Second)
+	txt, _ := c.Params["text"].(string)
+	widest := 0
+	for _, line := range strings.Split(txt, "\n") {
+		if n := len([]rune(line)); n > widest {
+			widest = n
+		}
+	}
+	if widest < bubbleWidth {
+		t.Fatalf("short button message was not widened: widest line %d runes", widest)
+	}
+	if padForButtons("a line that is definitely wider than the minimum bubble width") != "a line that is definitely wider than the minimum bubble width" {
+		t.Error("a wide message should not be padded")
+	}
+}
+
+// Kill is the hard stop, and it is offered next to Stop while a turn runs.
+func TestKillButton(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.store.Put(&Session{ThreadID: 62, Agent: "claude", Cwd: work, Created: time.Now(), LastUsed: time.Now()})
+	gw.handleUpdate(msg(62, "SLOW please"))
+	c := f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "thinking about it", 10*time.Second)
+	b := buttons(c)
+	if !has(b, "stop") || !has(b, "kill") {
+		t.Fatalf("a running turn must offer Stop and Kill, got %v", b)
+	}
+	gw.handleUpdate(press(62, 1002, "kill"))
+	f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "killed", 10*time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		gw.mu.Lock()
+		running := gw.running[62]
+		gw.mu.Unlock()
+		if !running {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("the turn was still running after Kill")
+}
+
 func TestModelThenEffortPicker(t *testing.T) {
 	gw, f, work := newTestGateway(t)
 	gw.store.Put(&Session{ThreadID: 9, Agent: "claude", Cwd: work, Created: time.Now(), LastUsed: time.Now()})

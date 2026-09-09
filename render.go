@@ -134,7 +134,7 @@ func (t *Turn) AddTool(status, name, detail string) {
 		if status == "start" {
 			line += " <code>" + html.EscapeString(truncate(detail, 200)) + "</code>"
 		} else if t.verbose {
-			line += "\n<blockquote expandable>" + html.EscapeString(truncate(detail, 700)) + "</blockquote>"
+			line += "\n<blockquote expandable>" + html.EscapeString(truncate(detail, 900)) + "</blockquote>"
 		}
 	}
 	// A finished call replaces the "started" line for the same tool, so the
@@ -155,7 +155,7 @@ func (t *Turn) AddTool(status, name, detail string) {
 					}
 					t.items[i].text = strings.Replace(head, "⚙", icon, 1)
 					if detail != "" && (t.verbose || status == "fail") {
-						t.items[i].text += "\n<blockquote expandable>" + html.EscapeString(truncate(detail, 700)) + "</blockquote>"
+						t.items[i].text += "\n<blockquote expandable>" + html.EscapeString(truncate(detail, 900)) + "</blockquote>"
 					}
 				}
 				return
@@ -189,7 +189,10 @@ func (t *Turn) keyboard() *Keyboard {
 	if !t.running {
 		return nil
 	}
-	return Rows([]Button{{Text: "⏹ Stop", CallbackData: "stop"}})
+	return Rows([]Button{
+		{Text: "⏹ Stop", CallbackData: "stop"},
+		{Text: "💀 Kill", CallbackData: "kill"},
+	})
 }
 
 // Flush pushes the current state to Telegram, respecting the edit interval

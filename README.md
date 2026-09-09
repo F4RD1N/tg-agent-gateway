@@ -13,8 +13,10 @@ Telegram forum group ──▶ gateway (Go) ──JSONL──▶ bridge (Node)
 ```
 
 Written in Go and JavaScript: Go owns Telegram, the topics and the rendering;
-a small Node sidecar drives each agent through its **official SDK**, so there
-is no CLI output to parse and conversations resume by their real session id.
+a Node sidecar drives each agent through its **official SDK**, so there is no
+CLI output to parse and conversations resume by their real session id. Each
+session gets its own worker process in its own process group, so Kill really
+does kill everything that session started.
 
 ## What it does
 
@@ -33,7 +35,9 @@ is no CLI output to parse and conversations resume by their real session id.
   sandbox, approval policy, web search and network access.
 - **Live answers.** The reply is one message that is edited as it streams,
   with tool calls shown as compact lines and details behind expandable
-  quotes. A Stop button interrupts the turn.
+  quotes. **Stop** ends the turn but leaves it resumable; **Kill** takes down
+  the agent process and every command it started, which is what you want when
+  something is hung.
 - **Many topics at once.** Sessions run in parallel; the edit pacing widens
   automatically as more of them stream, so they do not trip Telegram's
   group-wide flood limit.
@@ -87,6 +91,7 @@ In a **topic**:
 | `/cd` `/pwd` `/ls` | working folder (`/cd` browses with buttons) |
 | `/get <file>` `/run <cmd>` | fetch a file, run a shell command |
 | `/stop` | interrupt the running turn (or press Stop) |
+| `/kill` | kill the agent process and everything it started |
 | `/clear` | forget the conversation, keep the topic |
 | `/rename <name>` | rename the topic |
 | `/end` | close or delete the topic |
@@ -143,7 +148,12 @@ The Go tests run the whole update flow against an in-process Bot API stub, so
 button presses, topic creation, streaming edits, stopping and the pickers are
 all covered without touching Telegram.
 
+Two layout rules the tests enforce: no keyboard row holds more than two
+buttons, and a message that carries buttons is padded to a minimum width, or
+Telegram shrinks the bubble and clips the labels.
+
 Layout: `main.go` (CLI), `gateway.go` (routing, sessions, streaming),
-`handlers.go` (commands and buttons), `telegram.go` (Bot API), `bridge.go`
-(sidecar protocol), `render.go` (markdown → Telegram HTML), `store.go`
-(JSON state), `bridge/index.mjs` (the agent SDKs).
+`handlers.go` (commands and buttons), `telegram.go` (Bot API, keyboard
+layout), `bridge.go` (sidecar protocol), `render.go` (markdown → Telegram
+HTML), `store.go` (JSON state), `bridge/index.mjs` (worker supervision and
+model lists), `bridge/worker.mjs` (one session, both agent SDKs).

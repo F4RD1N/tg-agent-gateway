@@ -90,12 +90,13 @@ type Keyboard struct {
 	InlineKeyboard [][]Button `json:"inline_keyboard"`
 }
 
-func Rows(rows ...[]Button) *Keyboard { return &Keyboard{InlineKeyboard: rows} }
+func Rows(rows ...[]Button) *Keyboard { return (&Keyboard{InlineKeyboard: rows}).normalise() }
 
-// Grid lays buttons out n per row.
+// Grid lays buttons out n per row, never more than two: three across is
+// unreadable on a phone, where the labels get clipped.
 func Grid(n int, buttons []Button) *Keyboard {
-	if n < 1 {
-		n = 1
+	if n < 1 || n > maxButtonsPerRow {
+		n = maxButtonsPerRow
 	}
 	var rows [][]Button
 	for i := 0; i < len(buttons); i += n {
@@ -106,6 +107,47 @@ func Grid(n int, buttons []Button) *Keyboard {
 		rows = append(rows, buttons[i:end])
 	}
 	return &Keyboard{InlineKeyboard: rows}
+}
+
+// maxButtonsPerRow is a hard rule of this bot's layout, not a suggestion.
+const maxButtonsPerRow = 2
+
+// normalise splits any row that carries more than two buttons.
+func (k *Keyboard) normalise() *Keyboard {
+	if k == nil {
+		return nil
+	}
+	var rows [][]Button
+	for _, row := range k.InlineKeyboard {
+		for i := 0; i < len(row); i += maxButtonsPerRow {
+			end := i + maxButtonsPerRow
+			if end > len(row) {
+				end = len(row)
+			}
+			rows = append(rows, row[i:end])
+		}
+	}
+	k.InlineKeyboard = rows
+	return k
+}
+
+// padForButtons widens a message bubble. Telegram sizes an inline keyboard to
+// the width of the message above it, so a short line like "Which agent?"
+// squeezes the buttons until their labels are cut off. A blank Braille line
+// (U+2800, which renders as space and is not trimmed) sets a floor.
+const bubbleWidth = 36
+
+func padForButtons(text string) string {
+	widest := 0
+	for _, line := range strings.Split(text, "\n") {
+		if n := len([]rune(stripTags(line))); n > widest {
+			widest = n
+		}
+	}
+	if widest >= bubbleWidth {
+		return text
+	}
+	return text + "\n" + strings.Repeat("\u2800", bubbleWidth)
 }
 
 // ---------- client ----------
@@ -250,7 +292,8 @@ func (t *Telegram) Send(ctx context.Context, chatID int64, text string, o SendOp
 		p["message_thread_id"] = o.ThreadID
 	}
 	if o.Keyboard != nil {
-		p["reply_markup"] = o.Keyboard
+		p["reply_markup"] = o.Keyboard.normalise()
+		p["text"] = padForButtons(text)
 	}
 	if o.Silent {
 		p["disable_notification"] = true
@@ -274,7 +317,8 @@ func (t *Telegram) Edit(ctx context.Context, chatID int64, messageID int, text s
 		"link_preview_options": map[string]any{"is_disabled": true},
 	}
 	if kb != nil {
-		p["reply_markup"] = kb
+		p["reply_markup"] = kb.normalise()
+		p["text"] = padForButtons(text)
 	}
 	err := t.call(ctx, "editMessageText", p, nil)
 	if e, ok := err.(*apiError); ok && strings.Contains(e.Desc, "message is not modified") {
@@ -286,7 +330,7 @@ func (t *Telegram) Edit(ctx context.Context, chatID int64, messageID int, text s
 func (t *Telegram) EditKeyboard(ctx context.Context, chatID int64, messageID int, kb *Keyboard) error {
 	p := map[string]any{"chat_id": chatID, "message_id": messageID}
 	if kb != nil {
-		p["reply_markup"] = kb
+		p["reply_markup"] = kb.normalise()
 	} else {
 		p["reply_markup"] = map[string]any{"inline_keyboard": [][]Button{}}
 	}

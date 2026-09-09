@@ -47,7 +47,7 @@ func DefaultConfig() *Config {
 		APIBase:         "https://api.telegram.org",
 		BridgeCmd:       []string{"node", "/opt/tg-agent-gateway/bridge/index.mjs"},
 		EditIntervalMS:  2500,
-		MaxMessageChars: 3500,
+		MaxMessageChars: 3800,
 		ShowThinking:    false,
 		ShowTools:       true,
 		ClaudeModels: []Choice{
@@ -110,8 +110,8 @@ func LoadConfig(path string) (*Config, error) {
 	if c.EditIntervalMS < 1000 {
 		c.EditIntervalMS = 1000
 	}
-	if c.MaxMessageChars < 500 || c.MaxMessageChars > 4000 {
-		c.MaxMessageChars = 3500
+	if c.MaxMessageChars < 500 || c.MaxMessageChars > 3900 {
+		c.MaxMessageChars = 3800
 	}
 	if len(c.BridgeCmd) == 0 {
 		c.BridgeCmd = d.BridgeCmd

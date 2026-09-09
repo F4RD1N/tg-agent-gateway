@@ -34,6 +34,13 @@ rl.on('line', line => {
     case 'stop':
       out({ type: 'ok', sid: m.sid || '' });
       break;
+    case 'kill': {
+      const t = running.get(m.sid);
+      if (t) { clearTimeout(t); running.delete(m.sid); }
+      out({ type: 'killed', sid: m.sid, message: 'killed the agent and everything it was running' });
+      out({ type: 'done', sid: m.sid, session: 'sess-' + m.sid, subtype: 'killed', duration_ms: 3 });
+      break;
+    }
     case 'interrupt': {
       const t = running.get(m.sid);
       if (t) { clearTimeout(t); running.delete(m.sid); }

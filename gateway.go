@@ -244,8 +244,8 @@ func (gw *Gateway) submit(sess *Session, text string) {
 	busy := gw.running[sess.ThreadID]
 	gw.mu.Unlock()
 	if busy {
-		gw.reply(sess.ThreadID, "⏳ That session is still working. Stop it first, or wait for it to finish.", Rows(
-			[]Button{{Text: "⏹ Stop", CallbackData: "stop"}},
+		gw.reply(sess.ThreadID, "⏳ That session is still working. Stop it, kill it, or wait.", Rows(
+			[]Button{{Text: "⏹ Stop", CallbackData: "stop"}, {Text: "💀 Kill", CallbackData: "kill"}},
 		))
 		return
 	}
@@ -356,6 +356,11 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string) {
 				turn.AddNote("<i>queued behind the running turn</i>")
 			case "stopped":
 				turn.AddNote("⏹ <i>stopped</i>")
+			case "killed":
+				turn.AddNote("💀 <i>" + html.EscapeString(ev.Message) + "</i>")
+				turn.Flush(false)
+			case "idle":
+				// worker went quiet; nothing to show
 			case "error":
 				turn.AddNote("⚠️ " + html.EscapeString(truncate(ev.Message, 900)))
 				turn.Flush(false)
@@ -456,7 +461,8 @@ func (gw *Gateway) sessionKeyboard(sess *Session) *Keyboard {
 		[]Button{{Text: "🧠 Model", CallbackData: "model"}, {Text: "⚡ Effort", CallbackData: "effort"}},
 		[]Button{{Text: "📁 Folder", CallbackData: "cd"}, {Text: "🤖 Agent", CallbackData: "agent"}},
 		[]Button{{Text: "⚙️ Config", CallbackData: "cfg"}, {Text: "🔎 Details: " + onOff(sess.Verbose), CallbackData: "verbose"}},
-		[]Button{{Text: "🧹 New thread", CallbackData: "clear"}, {Text: "🗑 End session", CallbackData: "end"}},
+		[]Button{{Text: "🧹 New thread", CallbackData: "clear"}, {Text: "💀 Kill processes", CallbackData: "kill"}},
+		[]Button{{Text: "🗑 End session", CallbackData: "end"}},
 	)
 }
 
