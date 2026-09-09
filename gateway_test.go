@@ -207,7 +207,7 @@ func newTestGateway(t *testing.T) (*Gateway, *fakeTG, string) {
 	cfg.WorkspaceRoots = []string{work}
 	cfg.StatePath = filepath.Join(dir, "state.json")
 	cfg.APIBase = f.srv.URL
-	cfg.EditIntervalMS = 1000
+	cfg.EditIntervalMS = 400
 	cfg.BridgeCmd = []string{"node", "testdata/fakebridge.mjs"}
 
 	store, err := OpenStore(cfg.StatePath)
@@ -310,9 +310,15 @@ func TestPromptStreamsAndFinishes(t *testing.T) {
 	if !has(buttons(sent), "stop") {
 		t.Errorf("a running turn must offer a Stop button, got %v", buttons(sent))
 	}
-	// The tool call shows up, and the turn is sealed with a footer.
-	f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "Bash", 10*time.Second)
+	// The step shows as a human phrase, and the turn is sealed with a footer.
+	f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "Running", 10*time.Second)
 	f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "1.2s", 10*time.Second)
+	f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "1 step", 10*time.Second)
+	// The finished message must not carry the raw command or the tool name.
+	last := f.findAny([]string{"editMessageText"}, "1.2s")
+	if txt, _ := last.Params["text"].(string); strings.Contains(txt, "echo hi") || strings.Contains(txt, "<b>Bash</b>") {
+		t.Errorf("the finished message still shows the command line: %q", truncate(txt, 200))
+	}
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -695,13 +701,13 @@ func TestNewWithATopicName(t *testing.T) {
 	f.waitFor(t, "editMessageText", "Folder", 3*time.Second)
 	gw.handleUpdate(press(0, 1001, "newdir:here"))
 	c := f.waitFor(t, "createForumTopic", "", 3*time.Second)
-	if name, _ := c.Params["name"].(string); name != "My Project" {
-		t.Fatalf("topic should carry the name from /new, got %q", name)
+	if name, _ := c.Params["name"].(string); name != "Codex • My Project" {
+		t.Fatalf("the topic should be named agent then name, got %q", name)
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if s := gw.store.Get(555); s != nil {
-			if s.Title != "My Project" || s.Agent != "codex" || s.Cwd != work {
+			if s.Title != "Codex • My Project" || s.Name != "My Project" || s.Agent != "codex" || s.Cwd != work {
 				t.Fatalf("session does not match the request: %+v", s)
 			}
 			return
@@ -753,6 +759,52 @@ func TestSubscriptionSurvivesAnOverlappingTurn(t *testing.T) {
 	}
 }
 
+// A topic is always "<Agent> • <what you called it>", and the name survives a
+// rename or a switch of agent.
+func TestTopicTitles(t *testing.T) {
+	cases := []struct{ agent, name, want string }{
+		{"claude", "VPN App", "Claude • VPN App"},
+		{"codex", "VPN App", "Codex • VPN App"},
+		{"claude", "", "Claude"},
+		{"claude", "Claude • VPN App", "Claude • VPN App"}, // no stacking
+		{"codex", "Claude • VPN App", "Codex • VPN App"},   // switching agent
+		{"claude", "Claude Code · agentchat", "Claude • agentchat"},
+	}
+	for _, c := range cases {
+		if got := topicTitle(c.agent, c.name); got != c.want {
+			t.Errorf("topicTitle(%q, %q) = %q, want %q", c.agent, c.name, got, c.want)
+		}
+	}
+}
+
+func TestSwitchingAgentKeepsTheName(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.store.Put(&Session{ThreadID: 81, Agent: "claude", Name: "VPN App", Title: "Claude • VPN App",
+		Cwd: work, Created: time.Now(), LastUsed: time.Now()})
+	gw.handleUpdate(press(81, 1001, "agt:codex"))
+	c := f.waitFor(t, "editForumTopic", "", 3*time.Second)
+	if name, _ := c.Params["name"].(string); name != "Codex • VPN App" {
+		t.Fatalf("switching agent should keep the name, got %q", name)
+	}
+	if s := gw.store.Get(81); s == nil || s.Title != "Codex • VPN App" || s.Name != "VPN App" {
+		t.Fatalf("stored title is wrong: %+v", gw.store.Get(81))
+	}
+}
+
+func TestRenameKeepsTheAgentPrefix(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.store.Put(&Session{ThreadID: 82, Agent: "codex", Name: "old", Title: "Codex • old",
+		Cwd: work, Created: time.Now(), LastUsed: time.Now()})
+	gw.handleUpdate(msg(82, "/rename VPN App"))
+	c := f.waitFor(t, "editForumTopic", "", 3*time.Second)
+	if name, _ := c.Params["name"].(string); name != "Codex • VPN App" {
+		t.Fatalf("rename should keep the agent in front, got %q", name)
+	}
+	if s := gw.store.Get(82); s == nil || s.Name != "VPN App" || s.AutoName {
+		t.Fatalf("rename should store the bare name: %+v", gw.store.Get(82))
+	}
+}
+
 func TestParseNewArgs(t *testing.T) {
 	cases := []struct{ in, agent, path, name string }{
 		{"", "", "", ""},
@@ -777,8 +829,8 @@ func TestReconcileGivesEverySessionATopic(t *testing.T) {
 	gw.store.Put(&Session{ThreadID: 0, Agent: "claude", Cwd: work, Title: "Imported", Ref: "old-session", Created: time.Now(), LastUsed: time.Now()})
 	gw.reconcileTopics()
 	c := f.waitFor(t, "createForumTopic", "", 3*time.Second)
-	if name, _ := c.Params["name"].(string); name != "Imported" {
-		t.Errorf("recreated topic should keep the title, got %q", name)
+	if name, _ := c.Params["name"].(string); name != "Claude • Imported" {
+		t.Errorf("a recreated topic should keep its name under the agent, got %q", name)
 	}
 	if gw.store.Get(0) != nil {
 		t.Error("the old thread id should not stay in the store")
@@ -910,5 +962,97 @@ func TestPathAllowed(t *testing.T) {
 	}
 	if cfg.PathAllowed("/etc/passwd") {
 		t.Error("path outside the roots must be refused")
+	}
+}
+
+// ---------- step phrasing ----------
+
+// The whole point: a Telegram reader sees "Installing dependencies", never
+// /bin/bash -lc "npm install --no-fund 2>&1 | tail -20".
+func TestDescribeStep(t *testing.T) {
+	cases := []struct {
+		tool, detail, want string
+	}{
+		{"Bash", `/bin/bash -lc "npm install --no-fund"`, "Installing dependencies"},
+		{"Bash", `/bin/bash -lc 'pnpm add react'`, "Installing dependencies"},
+		{"Bash", `/bin/bash -lc "go test ./... 2>&1 | tail -40"`, "Running tests"},
+		{"Bash", `bash -lc "npm run build"`, "Building"},
+		{"Bash", `/bin/bash -lc 'git commit -m "wip"'`, "Committing changes"},
+		{"Bash", `/bin/bash -lc "git push origin main"`, "Syncing with git"},
+		{"Bash", `/bin/bash -lc "ls -ld /root/calculator 2>/dev/null; cat /root/x"`, "Looking around"},
+		{"Bash", `/bin/bash -lc "rg --files -g 'AGENTS.md' /root"`, "Searching the project"},
+		{"Bash", `/bin/bash -lc "cat /root/.config/codex-delivery/send.py"`, "Reading files"},
+		{"Bash", `/bin/bash -lc "mkdir -p /root/calculator/js"`, "Setting up files"},
+		{"Bash", `/bin/bash -lc "curl -s http://127.0.0.1:8088/health"`, "Checking the network"},
+		{"Bash", `/bin/bash -lc "node --version && npm --version"`, "Running a script"},
+		{"Bash", `/bin/bash -lc "systemctl restart nginx"`, "Managing services"},
+		{"Bash", `/bin/bash -lc "zip -r out.zip src"`, "Packaging files"},
+		{"Bash", `/bin/bash -lc "python3 -m pytest -q"`, "Running tests"},
+		{"Bash", `/bin/bash -lc "ss -ltnp"`, "Checking processes"},
+		{"Bash", `/bin/bash -lc "gofmt -w ."`, "Tidying the code"},
+		{"Read", "/root/calculator/js/app.js", "Reading js/app.js"},
+		{"Write", "/root/calculator/index.html", "Writing calculator/index.html"},
+		{"Edit", "/root/tg-agent-gateway/render.go", "Editing tg-agent-gateway/render.go"},
+		{"Grep", "func main", "Searching the project"},
+		{"WebFetch", "https://example.com/docs/page?x=1", "Reading example.com"},
+		{"WebSearch", "golang telegram", "Searching the web"},
+		{"Task", "review the diff", "Asking a subagent"},
+		{"TodoWrite", "4 items", "Planning the work"},
+	}
+	for _, c := range cases {
+		icon, phrase := describeStep(c.tool, c.detail)
+		if phrase != c.want {
+			t.Errorf("describeStep(%s, %q) = %q, want %q", c.tool, truncate(c.detail, 40), phrase, c.want)
+		}
+		if icon == "" {
+			t.Errorf("describeStep(%s) has no icon", c.tool)
+		}
+	}
+}
+
+func TestCleanCommand(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`/bin/bash -lc "echo hi"`, "echo hi"},
+		{`/bin/bash -lc 'ls -la'`, "ls -la"},
+		{"bash -c \"go   test  ./...\"", "go test ./..."},
+		{`sh -c 'printf "a b"'`, `printf "a b"`},
+		{"plain command", "plain command"},
+	}
+	for _, c := range cases {
+		if got := cleanCommand(c.in); got != c.want {
+			t.Errorf("cleanCommand(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	if got := firstCommand("FOO=1 npm install && npm test"); got != "npm install" {
+		t.Errorf("firstCommand = %q", got)
+	}
+}
+
+// Steps replace each other; they never pile up.
+func TestStepsReplaceRatherThanAccumulate(t *testing.T) {
+	gw, _, work := newTestGateway(t)
+	sess := &Session{ThreadID: 71, Agent: "claude", Cwd: work}
+	turn := gw.NewTurn(sess)
+	turn.SetStep("start", "Bash", `/bin/bash -lc "npm install"`)
+	turn.SetStep("ok", "Bash", "added 120 packages")
+	turn.SetStep("start", "Bash", `/bin/bash -lc "npm test"`)
+	body := turn.render()
+	if strings.Count(body, "<i>") != 1 {
+		t.Fatalf("expected exactly one step line, got %q", body)
+	}
+	if !strings.Contains(body, "Running tests") {
+		t.Fatalf("the current step should be the newest one, got %q", body)
+	}
+	if strings.Contains(body, "Installing") {
+		t.Fatalf("an older step is still on screen: %q", body)
+	}
+	// Words from the agent clear the step line.
+	turn.AddText("Done, the tests pass.")
+	if strings.Contains(turn.render(), "Running tests") {
+		t.Fatalf("the step should clear once the agent speaks: %q", turn.render())
+	}
+	turn.running = false
+	if strings.Contains(turn.render(), "<i>") {
+		t.Fatalf("a finished turn should carry no step line: %q", turn.render())
 	}
 }

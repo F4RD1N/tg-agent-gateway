@@ -21,7 +21,8 @@ does kill everything that session started.
 ## What it does
 
 - **A topic per session.** `/new` in General creates the topic, names it and
-  starts the agent. `/new My Project` names the topic yourself. Send a
+  starts the agent. Ask for a name and the topic becomes "Claude • VPN App";
+  the agent stays in front when you rename it or switch agents. Send a
   message in a topic and it goes to that session.
 - **Both agents, full access.** Claude Code runs with `bypassPermissions`,
   Codex with `danger-full-access` and no approval prompts. Switch a topic
@@ -34,20 +35,25 @@ does kill everything that session started.
   ceiling, *switch models when a message is flagged* (the refusal fallback)
   and whether `~/.claude/settings.json` is loaded; for Codex the sandbox,
   approval policy, web search and network access.
-- **Live answers.** The reply is one message that is edited as it streams,
-  with tool calls shown as compact lines and details behind expandable
-  quotes. **Stop** ends the turn but leaves it resumable; **Kill** takes down
-  the agent process and every command it started, which is what you want when
-  something is hung.
+- **Live answers, the way app builders show them.** The reply is one message
+  that is edited as it streams: the agent's own words, and under them a single
+  line for what it is doing now - "Installing dependencies", "Running tests",
+  "Editing app/main.go". Steps replace each other instead of piling up, and
+  command output is not shown at all unless Details are on, because a wall of
+  log hides the answer on a phone. **Stop** ends the turn but leaves it
+  resumable; **Kill** takes down the agent process and every command it
+  started.
 - **Many topics at once.** Sessions run in parallel; the edit pacing widens
   automatically as more of them stream, so they do not trip Telegram's
   group-wide flood limit.
 - **It manages the topics.** It creates, renames, closes and deletes them,
   and on startup it gives every remembered session a topic again, recreating
   any that were deleted while it was down.
-- **Files both ways.** Send a document to a topic and it lands in that
-  session's folder; `/get path` sends one back. `/run` executes a shell
-  command in the session's folder.
+- **Files both ways, in the right place.** Send a document to a topic and it
+  lands in that session's folder; `/get path` sends one back. Agents deliver
+  with `tg-send <file>`, which the gateway points at that session's own topic
+  through `AGENT_TG_*` in their environment, so builds and archives never go
+  to a private chat again. `/run` executes a shell command in the folder.
 
 ## Install
 
@@ -156,6 +162,8 @@ buttons, and a message that carries buttons is padded to a minimum width, or
 Telegram shrinks the bubble and clips the labels.
 
 Layout: `main.go` (CLI), `gateway.go` (routing, sessions, streaming),
+`steps.go` (tool calls to human phrases), `tools/tg-send` (delivery into a
+topic),
 `handlers.go` (commands and buttons), `telegram.go` (Bot API, keyboard
 layout), `bridge.go` (sidecar protocol), `render.go` (markdown → Telegram
 HTML), `store.go` (JSON state), `bridge/index.mjs` (worker supervision and

@@ -13,8 +13,10 @@ import (
 // Session is what the gateway remembers about one forum topic.
 type Session struct {
 	ThreadID int    `json:"thread_id"`
-	Title    string `json:"title"`
-	Agent    string `json:"agent"` // claude | codex
+	Title    string `json:"title"`               // what the topic is called: "Claude • VPN App"
+	Name     string `json:"name"`                // just the part you chose: "VPN App"
+	AutoName bool   `json:"auto_name,omitempty"` // the name came from the folder, so it follows /cd
+	Agent    string `json:"agent"`               // claude | codex
 	Cwd      string `json:"cwd"`
 	Model    string `json:"model"`
 	Effort   string `json:"effort"`

@@ -16,20 +16,38 @@ function out(obj) {
 }
 
 function getCodex() {
-  if (!codexClient) codexClient = new Codex();
+  // The SDK stops inheriting process.env once env is supplied, so the full
+  // environment is passed through with the topic destination added.
+  const env = childEnv();
+  const key = JSON.stringify([env.AGENT_TG_CHAT_ID, env.AGENT_TG_TOPIC_ID]);
+  if (!codexClient || codexClient.__key !== key) {
+    codexClient = new Codex({ env });
+    codexClient.__key = key;
+  }
   return codexClient;
 }
 
 function childEnv() {
   // Claude Code refuses to bypass permissions as root unless it believes it is
   // sandboxed. The gateway is deliberately full-access, so say so.
-  return { ...process.env, IS_SANDBOX: '1' };
+  const env = { ...process.env, IS_SANDBOX: '1' };
+  // Where this session's files belong: its own Telegram topic. tg-send and the
+  // older delivery helpers read these, so anything the agent delivers arrives
+  // in the topic the work is happening in.
+  if (s.tgChat) {
+    env.AGENT_TG_CHAT_ID = String(s.tgChat);
+    env.AGENT_TG_TOPIC_ID = String(s.tgTopic || '');
+    env.AGENT_TG_TOKEN = s.tgToken || '';
+    env.AGENT_SESSION_TOPIC = s.tgTitle || '';
+  }
+  return env;
 }
 
 const s = {
   sid: SID, agent: 'claude', cwd: process.cwd(), model: '', effort: '', ref: '',
   permMode: '', thinking: 0, maxTurns: 0, budget: 0, userSettings: false, fallback: '',
   sandbox: '', approval: '', webSearch: '', network: '',
+  tgChat: '', tgTopic: '', tgToken: '', tgTitle: '',
   queue: [], running: false, abort: null,
 };
 
@@ -41,6 +59,10 @@ function applyConfig(s, msg) {
   s.budget = msg.budget_usd || 0;
   s.userSettings = !!msg.user_settings;
   s.fallback = msg.fallback_model || '';
+  if (msg.tg_chat !== undefined) s.tgChat = msg.tg_chat || '';
+  if (msg.tg_topic !== undefined) s.tgTopic = msg.tg_topic || '';
+  if (msg.tg_token !== undefined) s.tgToken = msg.tg_token || '';
+  if (msg.tg_title !== undefined) s.tgTitle = msg.tg_title || '';
   s.sandbox = msg.sandbox || '';
   s.approval = msg.approval || '';
   s.webSearch = msg.web_search || '';

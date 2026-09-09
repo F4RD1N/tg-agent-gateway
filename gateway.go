@@ -74,6 +74,10 @@ func (gw *Gateway) command(kind string, sess *Session, text string) Command {
 		BudgetUSD: sess.BudgetUSD, UserSettings: sess.UserSettings, Fallback: sess.Fallback,
 		Sandbox: sess.Sandbox, Approval: sess.Approval,
 		WebSearch: sess.WebSearch, Network: sess.Network,
+		TGChat:  strconv.FormatInt(gw.cfg.ChatID, 10),
+		TGTopic: strconv.Itoa(sess.ThreadID),
+		TGToken: gw.cfg.BotToken,
+		TGTitle: sess.Title,
 	}
 }
 
@@ -264,6 +268,17 @@ func (gw *Gateway) submit(sess *Session, text string) {
 	go gw.pump(sess, turn, text)
 }
 
+// sessionPreamble is prepended to the first message of a conversation so the
+// agent knows where its files belong. Without it, both CLIs fall back to the
+// private-chat delivery helpers their own notes tell them to use.
+func sessionPreamble(sess *Session) string {
+	return "[gateway] You are answering inside a Telegram topic. " +
+		"To send the user a file, an archive or a build, run `tg-send <path>` " +
+		"(optionally with --caption \"...\"); it delivers into this topic. " +
+		"Do not use any other Telegram script, chat id or bot token. " +
+		"Keep your replies short and readable: they are being read on a phone.\n\n"
+}
+
 func (gw *Gateway) pump(sess *Session, turn *Turn, text string) {
 	sid := sidOf(sess.ThreadID)
 	ch := gw.bridge.Subscribe(sid)
@@ -276,6 +291,10 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string) {
 	}()
 
 	gw.tg.TypingAction(gw.ctx, gw.cfg.ChatID, sess.ThreadID)
+	typingBeat := 0
+	if sess.Ref == "" && !strings.HasPrefix(text, "/") {
+		text = sessionPreamble(sess) + text
+	}
 	err := gw.bridge.Send(gw.command("prompt", sess, text))
 	if err != nil {
 		turn.AddNote("⚠️ " + html.EscapeString(err.Error()))
@@ -283,7 +302,13 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string) {
 		return
 	}
 
-	ticker := time.NewTicker(time.Duration(gw.cfg.EditIntervalMS) * time.Millisecond)
+	// Tick faster than the edit interval, or a flush that becomes due just
+	// after a tick waits a whole extra period before it goes out.
+	tick := time.Duration(gw.cfg.EditIntervalMS) * time.Millisecond / 3
+	if tick < 300*time.Millisecond {
+		tick = 300 * time.Millisecond
+	}
+	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 	idle := time.NewTimer(45 * time.Minute)
 	defer idle.Stop()
@@ -295,7 +320,10 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string) {
 			return
 		case <-ticker.C:
 			turn.Flush(false)
-			gw.tg.TypingAction(gw.ctx, gw.cfg.ChatID, sess.ThreadID)
+			typingBeat++
+			if typingBeat%3 == 0 {
+				gw.tg.TypingAction(gw.ctx, gw.cfg.ChatID, sess.ThreadID)
+			}
 		case <-idle.C:
 			turn.AddNote("⚠️ no response for 45 minutes, giving up")
 			turn.Finish("")
@@ -330,31 +358,21 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string) {
 					turn.AddNote("<blockquote expandable>💭 " + html.EscapeString(truncate(ev.Text, 600)) + "</blockquote>")
 				}
 			case "tool":
-				if gw.cfg.ShowTools {
-					turn.AddTool(ev.Status, ev.Name, ev.Detail)
-					turn.Flush(false)
-				}
+				turn.SetStep(ev.Status, ev.Name, ev.Detail)
+				turn.Flush(false)
 			case "file":
-				icon := map[string]string{"add": "＋", "delete": "－", "update": "✎"}[ev.Kind]
-				if icon == "" {
-					icon = "✎"
-				}
-				turn.AddTool("ok", "Edit", icon+" "+ev.Path)
+				turn.SetFileStep(ev.Kind, ev.Path)
 				turn.Flush(false)
 			case "todo":
-				if len(ev.Items) > 0 {
-					var b strings.Builder
-					b.WriteString("<blockquote expandable>📋 plan\n")
-					for _, it := range ev.Items {
-						mark := "☐"
-						if it.Done {
-							mark = "☑"
-						}
-						b.WriteString(mark + " " + html.EscapeString(truncate(it.Text, 120)) + "\n")
+				// The plan is a step, not a permanent note: show the item the
+				// agent is on rather than the whole checklist every time.
+				for _, it := range ev.Items {
+					if !it.Done {
+						turn.step = "📋 <i>" + html.EscapeString(truncate(it.Text, 90)) + "…</i>"
+						break
 					}
-					b.WriteString("</blockquote>")
-					turn.AddNote(b.String())
 				}
+				turn.Flush(false)
 			case "busy":
 				turn.AddNote("<i>queued behind the running turn</i>")
 			case "stopped":
@@ -385,15 +403,22 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string) {
 				gw.mu.Lock()
 				delete(gw.running, sess.ThreadID)
 				gw.mu.Unlock()
-				turn.Finish(gw.footer(sess, ev))
+				turn.Finish(gw.footer(sess, turn, ev))
 				return
 			}
 		}
 	}
 }
 
-func (gw *Gateway) footer(sess *Session, ev Event) string {
+func (gw *Gateway) footer(sess *Session, turn *Turn, ev Event) string {
 	parts := []string{}
+	if turn != nil && turn.steps > 0 {
+		word := "steps"
+		if turn.steps == 1 {
+			word = "step"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", turn.steps, word))
+	}
 	if ev.DurationMS > 0 {
 		parts = append(parts, fmtDuration(ev.DurationMS))
 	}
@@ -419,20 +444,59 @@ func (gw *Gateway) footer(sess *Session, ev Event) string {
 
 // ---------------------------------------------------------------- sessions
 
-func (gw *Gateway) createSession(agent, cwd, name string, thread int) (*Session, error) {
-	title := strings.TrimSpace(name)
-	if title == "" {
-		title = agentLabel(agent) + " · " + filepath.Base(strings.TrimRight(cwd, "/"))
+// shortAgent is the name a topic title carries: the label is long enough
+// already once a project name is on the end of it.
+func shortAgent(agent string) string {
+	if agent == "codex" {
+		return "Codex"
 	}
+	return "Claude"
+}
+
+// topicTitle is the one place a topic name is composed, so the agent always
+// leads: "Claude • VPN App".
+func topicTitle(agent, name string) string {
+	name = bareName(strings.TrimSpace(name))
+	if name == "" {
+		return shortAgent(agent)
+	}
+	return truncate(shortAgent(agent)+" • "+name, 120)
+}
+
+// bareName strips an agent prefix off a title, so renaming or switching
+// agents does not stack them up ("Claude • Codex • thing").
+func bareName(title string) string {
+	t := strings.TrimSpace(title)
+	for _, sep := range []string{" • ", " · ", " - "} {
+		for _, prefix := range []string{"Claude Code", "Claude", "Codex"} {
+			if strings.HasPrefix(t, prefix+sep) {
+				return strings.TrimSpace(t[len(prefix)+len(sep):])
+			}
+		}
+	}
+	if t == "Claude" || t == "Codex" || t == "Claude Code" {
+		return ""
+	}
+	return t
+}
+
+func (gw *Gateway) createSession(agent, cwd, name string, thread int) (*Session, error) {
+	name = strings.TrimSpace(name)
+	auto := name == ""
+	if auto {
+		name = filepath.Base(strings.TrimRight(cwd, "/"))
+	}
+	title := topicTitle(agent, name)
 	if thread == 0 {
-		ft, err := gw.tg.CreateTopic(gw.ctx, gw.cfg.ChatID, truncate(title, 120), topicColor(agent))
+		ft, err := gw.tg.CreateTopic(gw.ctx, gw.cfg.ChatID, title, topicColor(agent))
 		if err != nil {
 			return nil, fmt.Errorf("could not create a topic (is the bot an admin with Manage Topics?): %w", err)
 		}
 		thread = ft.MessageThreadID
 	}
 	sess := &Session{
-		ThreadID: thread, Title: title, Agent: agent, Cwd: cwd,
+		ThreadID: thread, Title: title, Name: name, AutoName: auto,
+		Agent: agent, Cwd: cwd,
 		Created: time.Now(), LastUsed: time.Now(),
 	}
 	gw.store.Put(sess)
@@ -693,11 +757,16 @@ func (gw *Gateway) reconcileTopics() {
 // rehomeSession creates a topic for a session that has none and moves its
 // state (and the bridge's) to the new thread id.
 func (gw *Gateway) rehomeSession(sess *Session, header string) {
-	name := sess.Title
-	if name == "" {
-		name = agentLabel(sess.Agent) + " · " + filepath.Base(strings.TrimRight(sess.Cwd, "/"))
+	if sess.Name == "" {
+		// A session from an older gateway has a title but no name; keep what
+		// the topic was called rather than inventing one from the folder.
+		if sess.Name = bareName(sess.Title); sess.Name == "" {
+			sess.Name = filepath.Base(strings.TrimRight(sess.Cwd, "/"))
+			sess.AutoName = true
+		}
 	}
-	ft, err := gw.tg.CreateTopic(gw.ctx, gw.cfg.ChatID, truncate(name, 120), topicColor(sess.Agent))
+	name := topicTitle(sess.Agent, sess.Name)
+	ft, err := gw.tg.CreateTopic(gw.ctx, gw.cfg.ChatID, name, topicColor(sess.Agent))
 	if err != nil {
 		logf("could not create a topic for session %d: %v", sess.ThreadID, err)
 		return

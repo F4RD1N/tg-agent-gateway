@@ -63,23 +63,15 @@ func mdToHTML(s string) string {
 }
 
 // ---------- turn rendering ----------
+//
+// A turn is one message that is edited while the agent works. It shows the
+// agent's own words, and one line for what it is doing right now - the way an
+// app builder does it. Steps replace each other rather than piling up, and
+// command output is not shown at all unless Details are on: Telegram is not a
+// terminal, and a wall of log hides the answer.
 
-type itemKind int
-
-const (
-	itemText itemKind = iota
-	itemTool
-	itemNote
-)
-
-type turnItem struct {
-	kind itemKind
-	text string // markdown for itemText, ready HTML for the others
-}
-
-// Turn renders one agent turn into Telegram: a live message that is edited
-// while the answer streams, sealed and continued in a new message when it
-// grows past the size limit.
+// Turn renders one agent turn into Telegram, sealing the message and
+// continuing in a new one when it grows past the size limit.
 type Turn struct {
 	gw       *Gateway
 	chatID   int64
@@ -87,13 +79,17 @@ type Turn struct {
 	agent    string
 	verbose  bool
 
-	items    []turnItem
-	msgID    int
-	lastEdit time.Time
-	lastSent string
-	running  bool
-	stopping bool
-	started  time.Time
+	prose     strings.Builder
+	notes     []string
+	step      string // ready HTML for the current step, replaced as it changes
+	curIcon   string
+	curPhrase string
+	steps     int
+	msgID     int
+	lastEdit  time.Time
+	lastSent  string
+	running   bool
+	started   time.Time
 }
 
 func (gw *Gateway) NewTurn(sess *Session) *Turn {
@@ -114,73 +110,78 @@ func (t *Turn) AddText(s string) {
 	if s == "" {
 		return
 	}
-	if n := len(t.items); n > 0 && t.items[n-1].kind == itemText {
-		t.items[n-1].text += s
-		return
-	}
-	t.items = append(t.items, turnItem{kind: itemText, text: s})
+	t.prose.WriteString(s)
+	// New words from the agent mean the previous step is over.
+	t.step, t.curPhrase, t.curIcon = "", "", ""
 }
 
-func (t *Turn) AddTool(status, name, detail string) {
-	icon := "⚙"
+// SetStep replaces the "what it is doing now" line.
+//
+// Only the start of a step carries the command; when it finishes, the detail
+// is the output, which says nothing about what the step was. So the phrase is
+// worked out once, at the start, and reused when it ends.
+func (t *Turn) SetStep(status, tool, detail string) {
+	if status == "start" || t.curPhrase == "" {
+		t.curIcon, t.curPhrase = describeStep(tool, detail)
+	}
+	icon, phrase := t.curIcon, t.curPhrase
 	switch status {
-	case "ok":
-		icon = "✓"
+	case "start":
+		t.steps++
+		t.step = icon + " <i>" + html.EscapeString(phrase) + "…</i>"
+		return
 	case "fail":
-		icon = "✗"
+		t.step = "⚠️ <i>" + html.EscapeString(phrase) + " did not work</i>"
+	default: // ok
+		t.step = icon + " <i>" + html.EscapeString(phrase) + "</i>"
 	}
-	line := icon + " <b>" + html.EscapeString(name) + "</b>"
-	if detail != "" {
-		if status == "start" {
-			line += " <code>" + html.EscapeString(truncate(detail, 200)) + "</code>"
-		} else if t.verbose {
-			line += "\n<blockquote expandable>" + html.EscapeString(truncate(detail, 900)) + "</blockquote>"
-		}
+	if t.verbose && detail != "" {
+		t.step += "\n<blockquote expandable>" + html.EscapeString(truncate(oneLine(detail), 600)) + "</blockquote>"
 	}
-	// A finished call replaces the "started" line for the same tool, so the
-	// message does not fill up with pairs.
-	if status != "start" {
-		for i := len(t.items) - 1; i >= 0; i-- {
-			if t.items[i].kind != itemTool {
-				continue
-			}
-			if strings.Contains(t.items[i].text, "<b>"+html.EscapeString(name)+"</b>") && strings.HasPrefix(t.items[i].text, "⚙") {
-				old := t.items[i].text
-				if status == "ok" && !t.verbose {
-					t.items[i].text = strings.Replace(old, "⚙", "✓", 1)
-				} else {
-					head := old
-					if idx := strings.Index(old, "\n"); idx > 0 {
-						head = old[:idx]
-					}
-					t.items[i].text = strings.Replace(head, "⚙", icon, 1)
-					if detail != "" && (t.verbose || status == "fail") {
-						t.items[i].text += "\n<blockquote expandable>" + html.EscapeString(truncate(detail, 900)) + "</blockquote>"
-					}
-				}
-				return
-			}
-		}
-	}
-	t.items = append(t.items, turnItem{kind: itemTool, text: line})
+	t.curPhrase, t.curIcon = "", ""
 }
 
+// SetFileStep is the codex file_change event: an edit the agent made.
+func (t *Turn) SetFileStep(kind, path string) {
+	t.steps++
+	verb := "Editing"
+	icon := "✏️"
+	switch kind {
+	case "add":
+		verb = "Creating"
+	case "delete":
+		verb = "Deleting"
+		icon = "🗑"
+	}
+	t.step = icon + " <i>" + html.EscapeString(verb+" "+shortTarget(path)) + "</i>"
+}
+
+// AddNote is for the few things that must stay on screen: errors, a stop, a
+// kill, a compaction.
 func (t *Turn) AddNote(html string) {
-	t.items = append(t.items, turnItem{kind: itemNote, text: html})
+	t.notes = append(t.notes, html)
+}
+
+func oneLine(s string) string {
+	return strings.TrimSpace(strings.Join(strings.Fields(s), " "))
 }
 
 func (t *Turn) render() string {
 	var b strings.Builder
-	for i, it := range t.items {
-		if i > 0 {
-			b.WriteString("\n")
+	if body := strings.TrimSpace(t.prose.String()); body != "" {
+		b.WriteString(mdToHTML(body))
+	}
+	for _, n := range t.notes {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
 		}
-		switch it.kind {
-		case itemText:
-			b.WriteString(mdToHTML(strings.TrimRight(it.text, "\n")))
-		default:
-			b.WriteString(it.text)
+		b.WriteString(n)
+	}
+	if t.running && t.step != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
 		}
+		b.WriteString(t.step)
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -204,21 +205,23 @@ func (t *Turn) Flush(force bool) {
 	}
 	body := t.render()
 	if body == "" {
-		if t.running {
-			body = "<i>" + agentLabel(t.agent) + " is working…</i>"
-		} else {
+		if !t.running {
 			return
 		}
+		body = "<i>" + agentLabel(t.agent) + " is thinking…</i>"
 	}
 	max := t.gw.cfg.MaxMessageChars
 	for len([]rune(body)) > max {
 		head, tail := splitHTML(body, max)
 		t.push(head, false)
-		t.msgID = 0 // next push starts a new message
-		t.items = []turnItem{{kind: itemText, text: ""}}
-		t.items = nil
-		body = tail
+		// Everything already sent stays in the sealed message; the rest
+		// continues in a fresh one.
+		t.msgID = 0
 		t.lastSent = ""
+		t.prose.Reset()
+		t.notes = nil
+		t.prose.WriteString(stripTags(tail))
+		body = tail
 	}
 	t.push(body, t.running)
 	t.lastEdit = time.Now()
@@ -257,11 +260,12 @@ func (t *Turn) push(body string, withKeyboard bool) {
 	t.lastSent = body
 }
 
-// Finish seals the turn: last edit, footer, keyboard removed.
+// Finish seals the turn: the step line goes away, a quiet footer replaces it.
 func (t *Turn) Finish(footer string) {
 	t.running = false
+	t.step = ""
 	if footer != "" {
-		t.AddNote("<i>" + footer + "</i>")
+		t.notes = append(t.notes, "<i>"+footer+"</i>")
 	}
 	t.Flush(true)
 	if t.msgID != 0 {

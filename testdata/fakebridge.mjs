@@ -61,7 +61,12 @@ rl.on('line', line => {
       out({ type: 'delta', sid, text: 'world' });
       out({ type: 'tool', sid, status: 'start', name: 'Bash', detail: 'echo hi' });
       out({ type: 'tool', sid, status: 'ok', name: 'Bash', detail: 'hi' });
-      out({ type: 'done', sid, session: 'sess-' + sid, cost: 0.01, duration_ms: 1234, tokens: { input: 10, output: 3 }, subtype: 'success' });
+      // Hold briefly so the gateway flushes once while the step is showing,
+      // the way a real turn does.
+      running.set(sid, setTimeout(() => {
+        running.delete(sid);
+        out({ type: 'done', sid, session: 'sess-' + sid, cost: 0.01, duration_ms: 1234, tokens: { input: 10, output: 3 }, subtype: 'success' });
+      }, 1400));
       break;
     }
   }

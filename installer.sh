@@ -53,7 +53,7 @@ die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 if [ "$UNINSTALL" -eq 1 ]; then
   systemctl disable --now tg-agent-gateway 2>/dev/null || true
   rm -f "$UNIT"; systemctl daemon-reload
-  rm -f "$BIN"; rm -rf "$APPDIR"
+  rm -f "$BIN" /usr/local/bin/tg-send; rm -rf "$APPDIR"
   if [ "$PURGE" -eq 1 ]; then rm -rf "$CONFIG_DIR" "$DATA_DIR"; log "config and state removed"; fi
   log "uninstalled"
   exit 0
@@ -105,6 +105,9 @@ install -m 0644 "$SRC/bridge/worker.mjs" "$APPDIR/bridge/worker.mjs"
 install -m 0644 "$SRC/bridge/package.json" "$APPDIR/bridge/package.json"
 [ -f "$SRC/bridge/package-lock.json" ] && install -m 0644 "$SRC/bridge/package-lock.json" "$APPDIR/bridge/package-lock.json"
 ( cd "$APPDIR/bridge" && npm install --omit=dev --no-fund --no-audit --silent )
+
+# tg-send: how an agent delivers a file into its own topic.
+install -m 0755 "$SRC/tools/tg-send" /usr/local/bin/tg-send
 
 # ---------------------------------------------------------------- config
 mkdir -p "$CONFIG_DIR" "$DATA_DIR"; chmod 700 "$DATA_DIR"

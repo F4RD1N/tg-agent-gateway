@@ -96,12 +96,17 @@ func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 				gw.reply(thread, "Usage: <code>/rename New name</code>", nil)
 				return
 			}
-			if err := gw.tg.EditTopic(gw.ctx, gw.cfg.ChatID, thread, truncate(arg, 120)); err != nil {
+			title := topicTitle(s.Agent, arg)
+			if err := gw.tg.EditTopic(gw.ctx, gw.cfg.ChatID, thread, title); err != nil {
 				gw.reply(thread, "⚠️ "+html.EscapeString(err.Error()), nil)
 				return
 			}
-			gw.store.Update(thread, func(x *Session) { x.Title = arg })
-			gw.reply(thread, "✏️ topic renamed to <b>"+html.EscapeString(arg)+"</b>", nil)
+			gw.store.Update(thread, func(x *Session) {
+				x.Name = arg
+				x.AutoName = false
+				x.Title = title
+			})
+			gw.reply(thread, "✏️ topic renamed to <b>"+html.EscapeString(title)+"</b>", nil)
 		})
 	case "pwd":
 		gw.needSession(thread, sess, func(s *Session) {
@@ -782,8 +787,18 @@ func (gw *Gateway) setCwd(thread int, sess *Session, arg string) {
 		gw.reply(thread, "No such folder: <code>"+html.EscapeString(p)+"</code>", nil)
 		return
 	}
-	ns := gw.store.Update(thread, func(s *Session) { s.Cwd = p })
-	_ = gw.bridge.Send(Command{Type: "start", SID: sidOf(thread), Agent: ns.Agent, Cwd: p, Model: ns.Model, Effort: ns.Effort, Resume: ns.Ref})
+	ns := gw.store.Update(thread, func(s *Session) {
+		s.Cwd = p
+		// A title nobody chose follows the folder it is working in.
+		if s.AutoName {
+			s.Name = filepath.Base(strings.TrimRight(p, "/"))
+			s.Title = topicTitle(s.Agent, s.Name)
+		}
+	})
+	if ns.AutoName {
+		_ = gw.tg.EditTopic(gw.ctx, gw.cfg.ChatID, thread, ns.Title)
+	}
+	_ = gw.bridge.Send(gw.command("start", ns, ""))
 	gw.reply(thread, "📁 now <code>"+html.EscapeString(p)+"</code>", gw.sessionKeyboard(ns))
 }
 
@@ -1028,7 +1043,11 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 		_ = gw.bridge.Send(Command{Type: "start", SID: sidOf(thread), Agent: ns.Agent, Cwd: ns.Cwd})
 		ack(agentLabel(arg))
 		_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, gw.sessionHeader(ns), gw.sessionKeyboard(ns))
-		_ = gw.tg.EditTopic(gw.ctx, gw.cfg.ChatID, thread, truncate(agentLabel(ns.Agent)+" · "+filepath.Base(ns.Cwd), 120))
+		// The topic keeps the name you chose; only the agent in front changes.
+		title := topicTitle(ns.Agent, ns.Name)
+		if err := gw.tg.EditTopic(gw.ctx, gw.cfg.ChatID, thread, title); err == nil {
+			gw.store.Update(thread, func(x *Session) { x.Title = title })
+		}
 
 	case "cfg":
 		if sess == nil {

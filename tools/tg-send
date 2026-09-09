@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Send a file or a note into the Telegram topic this agent session lives in.
+
+The gateway exports AGENT_TG_TOKEN, AGENT_TG_CHAT_ID and AGENT_TG_TOPIC_ID
+into every agent process, so anything delivered from inside a session lands in
+that session's own topic rather than in a private chat.
+
+    tg-send report.pdf
+    tg-send --caption "the finished build" app.apk
+    tg-send --text "done, the tests pass"
+
+Outside a session (no AGENT_TG_* in the environment) it falls back to the
+settings file the older delivery helpers use, so existing habits keep working.
+"""
+import argparse
+import json
+import mimetypes
+import os
+import pathlib
+import sys
+import urllib.error
+import urllib.request
+import uuid
+
+FALLBACK = pathlib.Path("/root/.config/codex-delivery/telegram.json")
+LIMIT = 50 * 1024 * 1024  # Telegram's bot upload ceiling
+
+
+def destination():
+    token = os.environ.get("AGENT_TG_TOKEN", "")
+    chat = os.environ.get("AGENT_TG_CHAT_ID", "")
+    topic = os.environ.get("AGENT_TG_TOPIC_ID", "")
+    if token and chat:
+        return token, chat, topic
+    if FALLBACK.exists():
+        s = json.loads(FALLBACK.read_text())
+        return s["bot_token"], str(s["chat_id"]), ""
+    sys.exit("no Telegram destination: AGENT_TG_TOKEN and AGENT_TG_CHAT_ID are not set")
+
+
+def call(token, method, data, content_type="application/json"):
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=data,
+        headers={"Content-Type": content_type},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            body = json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("description", "HTTP error")
+        except Exception:
+            detail = f"HTTP {e.code}"
+        sys.exit(f"telegram refused {method}: {detail}")
+    except Exception as e:
+        sys.exit(f"telegram unreachable: {type(e).__name__}")
+    if not body.get("ok"):
+        sys.exit(f"telegram refused {method}: {body.get('description')}")
+    return body["result"]
+
+
+def fields(chat, topic, extra):
+    out = [("chat_id", chat)]
+    if topic:
+        out.append(("message_thread_id", topic))
+    out.extend(extra)
+    return out
+
+
+def send_text(token, chat, topic, text):
+    payload = {"chat_id": chat, "text": text}
+    if topic:
+        payload["message_thread_id"] = int(topic)
+    r = call(token, "sendMessage", json.dumps(payload).encode())
+    print(json.dumps({"ok": True, "message_id": r["message_id"]}))
+
+
+def send_file(token, chat, topic, path, caption):
+    f = pathlib.Path(path)
+    if not f.is_file():
+        sys.exit(f"not a file: {path}")
+    size = f.stat().st_size
+    if size > LIMIT:
+        sys.exit(
+            f"{f.name} is {size} bytes, over Telegram's 50 MiB limit for bots; "
+            "publish it to the download server and send the link instead"
+        )
+    boundary = "----tgsend" + uuid.uuid4().hex
+    parts = []
+    for key, value in fields(chat, topic, [("caption", caption)]):
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+        )
+    name = f.name.replace('"', "_").replace("\r", "").replace("\n", "")
+    ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{name}"\r\n'
+        f"Content-Type: {ctype}\r\n\r\n".encode()
+        + f.read_bytes()
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    r = call(token, "sendDocument", b"".join(parts), f"multipart/form-data; boundary={boundary}")
+    print(json.dumps({"ok": True, "file": f.name, "size": size, "message_id": r["message_id"]}))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="send files into this session's Telegram topic")
+    ap.add_argument("files", nargs="*")
+    ap.add_argument("--caption", default="")
+    ap.add_argument("--text")
+    ap.add_argument("--where", action="store_true", help="print the destination and exit")
+    a = ap.parse_args()
+    token, chat, topic = destination()
+    if a.where:
+        print(json.dumps({"chat_id": chat, "topic_id": topic or None}))
+        return
+    if a.text:
+        send_text(token, chat, topic, a.text)
+    for path in a.files:
+        send_file(token, chat, topic, path, a.caption)
+    if not a.files and not a.text:
+        ap.error("give a file or --text")
+
+
+if __name__ == "__main__":
+    main()

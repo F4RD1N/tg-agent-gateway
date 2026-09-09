@@ -78,10 +78,16 @@ type Command struct {
 	BudgetUSD    float64 `json:"budget_usd,omitempty"`
 	UserSettings bool    `json:"user_settings,omitempty"`
 	Fallback     string  `json:"fallback_model,omitempty"`
-	Sandbox      string  `json:"sandbox,omitempty"`
-	Approval     string  `json:"approval,omitempty"`
-	WebSearch    string  `json:"web_search,omitempty"`
-	Network      string  `json:"network,omitempty"`
+
+	// Where this session's files should be delivered.
+	TGChat    string `json:"tg_chat,omitempty"`
+	TGTopic   string `json:"tg_topic,omitempty"`
+	TGToken   string `json:"tg_token,omitempty"`
+	TGTitle   string `json:"tg_title,omitempty"`
+	Sandbox   string `json:"sandbox,omitempty"`
+	Approval  string `json:"approval,omitempty"`
+	WebSearch string `json:"web_search,omitempty"`
+	Network   string `json:"network,omitempty"`
 }
 
 // Bridge owns the Node sidecar: one process, many sessions, restarted if it
