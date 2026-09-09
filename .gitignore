@@ -1,0 +1,4 @@
+/tg-agent-gateway
+/bridge/node_modules/
+*.zip
+*.log
