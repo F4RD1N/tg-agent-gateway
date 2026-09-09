@@ -77,6 +77,7 @@ type Command struct {
 	MaxTurns     int     `json:"max_turns,omitempty"`
 	BudgetUSD    float64 `json:"budget_usd,omitempty"`
 	UserSettings bool    `json:"user_settings,omitempty"`
+	Fallback     string  `json:"fallback_model,omitempty"`
 	Sandbox      string  `json:"sandbox,omitempty"`
 	Approval     string  `json:"approval,omitempty"`
 	WebSearch    string  `json:"web_search,omitempty"`

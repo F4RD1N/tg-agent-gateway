@@ -258,6 +258,24 @@ func (t *Telegram) GetMe(ctx context.Context) (*TGUser, error) {
 	return &u, err
 }
 
+// BotCommand is one entry in Telegram's "/" menu.
+type BotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+// SetCommands publishes the command menu, both globally and for the group, so
+// typing "/" in the chat lists what the bot understands.
+func (t *Telegram) SetCommands(ctx context.Context, chatID int64, cmds []BotCommand) error {
+	if err := t.call(ctx, "setMyCommands", map[string]any{"commands": cmds}, nil); err != nil {
+		return err
+	}
+	return t.call(ctx, "setMyCommands", map[string]any{
+		"commands": cmds,
+		"scope":    map[string]any{"type": "chat", "chat_id": chatID},
+	}, nil)
+}
+
 func (t *Telegram) GetChat(ctx context.Context, chatID int64) (*TGChat, error) {
 	var c TGChat
 	err := t.call(ctx, "getChat", map[string]any{"chat_id": chatID}, &c)

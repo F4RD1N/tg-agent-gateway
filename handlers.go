@@ -30,6 +30,7 @@ Each topic in this group is one agent session. Write a message in a topic and it
 /stop — interrupt the current turn
 /kill — kill the agent and everything it started
 /clear — forget the conversation, keep the topic
+/compact — ask the agent to compact its context
 /status — what this session is
 /verbose — show tool output and thinking
 
@@ -50,6 +51,14 @@ func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 		gw.cmdNew(thread, arg)
 	case "sessions", "list":
 		gw.cmdSessions(thread)
+	case "compact":
+		gw.needSession(thread, sess, func(s *Session) {
+			text := "/compact"
+			if arg != "" {
+				text += " " + arg
+			}
+			gw.submit(s, text)
+		})
 	case "stop":
 		gw.cmdStop(thread)
 	case "kill":
@@ -220,6 +229,14 @@ func configOptions() []configOption {
 			},
 		},
 		{
+			// Claude Code calls this "switch models when a message is flagged":
+			// when the model refuses, the turn is retried on the fallback model.
+			Key: "fallback", Icon: "🛟", Label: "Switch model when flagged", Agent: "claude",
+			Choices: []Choice{{ID: "", Label: "Off"}},
+			Current: func(s *Session) string { return s.Fallback },
+			Apply:   func(s *Session, v string) { s.Fallback = v },
+		},
+		{
 			Key: "usercfg", Icon: "📚", Label: "Load ~/.claude settings", Agent: "claude",
 			Choices: []Choice{
 				{ID: "off", Label: "Ignore them"},
@@ -315,6 +332,9 @@ func choiceLabel(o *configOption, sess *Session) string {
 		}
 	}
 	if cur == "" {
+		if o.Key == "fallback" {
+			return "Off"
+		}
 		return "Default"
 	}
 	return cur
@@ -344,6 +364,31 @@ func (gw *Gateway) showConfigChoice(thread, editMsg int, sess *Session, key stri
 		gw.showConfig(thread, editMsg, sess)
 		return
 	}
+	if key == "fallback" {
+		// The choices are the agent's own models, so they are fetched.
+		go func() {
+			models, err := gw.fetchModels(sess.Agent)
+			if err != nil {
+				models = gw.fallbackModels(sess.Agent)
+			}
+			choices := []Choice{{ID: "", Label: "Off"}}
+			for _, m := range models {
+				if m.ID == "" || m.ID == "default" {
+					continue
+				}
+				choices = append(choices, Choice{ID: m.ID, Label: m.Label})
+			}
+			opt := *o
+			opt.Choices = choices
+			gw.renderConfigChoice(thread, editMsg, sess, &opt,
+				"Retry on another model when a message is flagged.")
+		}()
+		return
+	}
+	gw.renderConfigChoice(thread, editMsg, sess, o, "")
+}
+
+func (gw *Gateway) renderConfigChoice(thread, editMsg int, sess *Session, o *configOption, note string) {
 	cur := o.Current(sess)
 	var buttons []Button
 	for _, c := range o.Choices {
@@ -355,11 +400,15 @@ func (gw *Gateway) showConfigChoice(thread, editMsg int, sess *Session, key stri
 		if id == "" {
 			id = "-"
 		}
-		buttons = append(buttons, Button{Text: label, CallbackData: "cf:" + key + ":" + id})
+		buttons = append(buttons, Button{Text: truncate(label, 40), CallbackData: "cf:" + o.Key + ":" + id})
 	}
 	kb := Grid(2, buttons)
 	kb.InlineKeyboard = append(kb.InlineKeyboard, []Button{{Text: "‹ Config", CallbackData: "cfg"}})
-	gw.notify(thread, editMsg, o.Icon+" <b>"+o.Label+"</b>", kb)
+	title := o.Icon + " <b>" + o.Label + "</b>"
+	if note != "" {
+		title += "\n<i>" + html.EscapeString(note) + "</i>"
+	}
+	gw.notify(thread, editMsg, title, kb)
 }
 
 // askEnd offers the two ways a topic can go away, both on buttons.
@@ -540,20 +589,19 @@ func (gw *Gateway) showDirs(thread int, dir, kind, agent, name string, editMsg i
 	if kind == "cd" {
 		title = "Working folder:\n<code>" + html.EscapeString(dir) + "</code>"
 	}
-	var msgID int
+	menu := &pending{kind: kind, agent: agent, name: name, dirs: append(list, dir), threadID: thread}
 	if editMsg > 0 {
+		gw.rememberMenu(editMsg, menu)
 		if err := gw.tg.Edit(gw.ctx, gw.cfg.ChatID, editMsg, title, kb); err == nil {
-			msgID = editMsg
-		}
-	}
-	if msgID == 0 {
-		m := gw.reply(thread, title, kb)
-		if m == nil {
 			return
 		}
-		msgID = m.MessageID
+		logf("folder menu: falling back to a new message")
 	}
-	gw.rememberMenu(msgID, &pending{kind: kind, agent: agent, name: name, dirs: append(list, dir), threadID: thread})
+	m := gw.reply(thread, title, kb)
+	if m == nil {
+		return
+	}
+	gw.rememberMenu(m.MessageID, menu)
 }
 
 // showModels lists everything the agent itself reports, on buttons. Asking
@@ -587,11 +635,10 @@ func (gw *Gateway) showModels(thread int, sess *Session, editMsg int) {
 			title += "\n<i>(could not reach the agent, showing the configured list)</i>"
 		}
 		if msgID > 0 {
+			gw.rememberMenu(msgID, &pending{kind: "model", agent: sess.Agent, models: models, threadID: thread})
 			if e := gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, title, kb); e != nil {
 				logf("model menu: %v", e)
-				return
 			}
-			gw.rememberMenu(msgID, &pending{kind: "model", agent: sess.Agent, models: models, threadID: thread})
 			return
 		}
 		if m := gw.reply(thread, title, kb); m != nil {
@@ -649,18 +696,17 @@ func (gw *Gateway) presentEfforts(thread, editMsg int, sess *Session, models []M
 	title += "\n\nHow hard should it think?"
 	msgID := editMsg
 	if msgID > 0 {
+		gw.rememberMenu(msgID, &pending{kind: "effort", agent: sess.Agent, models: models, modelIdx: idx, threadID: thread})
 		if err := gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, title, kb); err != nil {
 			logf("effort menu: %v", err)
-			return
 		}
-	} else {
-		m := gw.reply(thread, title, kb)
-		if m == nil {
-			return
-		}
-		msgID = m.MessageID
+		return
 	}
-	gw.rememberMenu(msgID, &pending{kind: "effort", agent: sess.Agent, models: models, modelIdx: idx, threadID: thread})
+	sent := gw.reply(thread, title, kb)
+	if sent == nil {
+		return
+	}
+	gw.rememberMenu(sent.MessageID, &pending{kind: "effort", agent: sess.Agent, models: models, modelIdx: idx, threadID: thread})
 }
 
 func (gw *Gateway) showAgents(thread int, sess *Session, editMsg int) {

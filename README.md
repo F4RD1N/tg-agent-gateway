@@ -31,8 +31,9 @@ does kill everything that session started.
   effort levels that model accepts (low … max, and Codex's ultra).
 - **A Config button.** Everything `/config` would offer, on buttons and per
   session: for Claude the permission mode, thinking budget, turn limit, cost
-  ceiling and whether `~/.claude/settings.json` is loaded; for Codex the
-  sandbox, approval policy, web search and network access.
+  ceiling, *switch models when a message is flagged* (the refusal fallback)
+  and whether `~/.claude/settings.json` is loaded; for Codex the sandbox,
+  approval policy, web search and network access.
 - **Live answers.** The reply is one message that is edited as it streams,
   with tool calls shown as compact lines and details behind expandable
   quotes. **Stop** ends the turn but leaves it resumable; **Kill** takes down
@@ -93,13 +94,15 @@ In a **topic**:
 | `/stop` | interrupt the running turn (or press Stop) |
 | `/kill` | kill the agent process and everything it started |
 | `/clear` | forget the conversation, keep the topic |
+| `/compact` | compact the agent's context |
 | `/rename <name>` | rename the topic |
 | `/end` | close or delete the topic |
 | `/verbose` | show tool output and thinking |
 | `/status` | what this session is, with its buttons |
 
-Anything else starting with `/` is passed to the agent, so Claude's own
-commands (`/compact`, `/context`, …) work.
+Every command above is registered with Telegram, so typing `/` in the group
+lists them. Anything else starting with `/` is passed to the agent, so its
+own commands work too.
 
 ## Configuration
 

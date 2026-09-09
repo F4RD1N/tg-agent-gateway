@@ -71,7 +71,7 @@ func (gw *Gateway) command(kind string, sess *Session, text string) Command {
 		Type: kind, SID: sidOf(sess.ThreadID), Agent: sess.Agent, Cwd: sess.Cwd,
 		Model: sess.Model, Effort: sess.Effort, Resume: sess.Ref, Text: text,
 		PermMode: sess.PermMode, Thinking: sess.Thinking, MaxTurns: sess.MaxTurns,
-		BudgetUSD: sess.BudgetUSD, UserSettings: sess.UserSettings,
+		BudgetUSD: sess.BudgetUSD, UserSettings: sess.UserSettings, Fallback: sess.Fallback,
 		Sandbox: sess.Sandbox, Approval: sess.Approval,
 		WebSearch: sess.WebSearch, Network: sess.Network,
 	}
@@ -113,6 +113,9 @@ func (gw *Gateway) Run() error {
 		return err
 	}
 	logf("gateway ready as @%s in %q (%d)", me.Username, chat.Title, chat.ID)
+	if err := gw.tg.SetCommands(gw.ctx, gw.cfg.ChatID, botCommands()); err != nil {
+		logf("could not publish the command menu: %v", err)
+	}
 	gw.reconcileTopics()
 
 	offset := 0
@@ -356,6 +359,9 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string) {
 				turn.AddNote("<i>queued behind the running turn</i>")
 			case "stopped":
 				turn.AddNote("⏹ <i>stopped</i>")
+			case "note":
+				turn.AddNote("ℹ️ <i>" + html.EscapeString(ev.Message) + "</i>")
+				turn.Flush(false)
 			case "killed":
 				turn.AddNote("💀 <i>" + html.EscapeString(ev.Message) + "</i>")
 				turn.Flush(false)
@@ -764,6 +770,9 @@ func configSummary(sess *Session) string {
 		if sess.UserSettings {
 			parts = append(parts, "~/.claude settings")
 		}
+		if sess.Fallback != "" {
+			parts = append(parts, "flagged → "+sess.Fallback)
+		}
 	}
 	return strings.Join(parts, " · ")
 }
@@ -784,4 +793,31 @@ func permLabel(mode string) string {
 		return "auto"
 	}
 	return mode
+}
+
+// botCommands is what Telegram shows when you type "/" in the group.
+func botCommands() []BotCommand {
+	return []BotCommand{
+		{"new", "start a session (agent and folder on buttons)"},
+		{"sessions", "list the running sessions"},
+		{"status", "what this session is, with its buttons"},
+		{"model", "pick the model, then its effort level"},
+		{"config", "permissions, thinking, limits, sandbox"},
+		{"agent", "switch between Claude Code and Codex"},
+		{"effort", "how hard the model should think"},
+		{"compact", "compact the agent's context"},
+		{"clear", "forget the conversation, keep the topic"},
+		{"stop", "interrupt the current turn"},
+		{"kill", "kill the agent and everything it started"},
+		{"cd", "change the working folder"},
+		{"pwd", "show the working folder"},
+		{"ls", "list the working folder"},
+		{"get", "send me a file from the folder"},
+		{"run", "run a shell command in the folder"},
+		{"verbose", "show tool output and thinking"},
+		{"rename", "rename this topic"},
+		{"end", "close or delete this topic"},
+		{"help", "how this bot works"},
+		{"id", "chat, user and topic ids"},
+	}
 }

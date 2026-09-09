@@ -164,7 +164,7 @@ async function claudeModels() {
     const list = await q.supportedModels();
     return list.map(m => ({
       id: m.value,
-      label: m.displayName || m.value,
+      label: cleanLabel(m.displayName || m.value),
       description: m.description || '',
       efforts: m.supportsEffort ? (m.supportedEffortLevels || []) : [],
       default_effort: '',
@@ -176,6 +176,16 @@ async function claudeModels() {
   }
 }
 
+// cleanLabel drops the parenthetical noise Claude puts in display names, so
+// a button reads "Default" rather than "Default (recommended)".
+function cleanLabel(label) {
+  return String(label)
+    .replace(/\s*\((?:recommended|default)\)\s*/gi, ' ')
+    .replace(/\s*\brecommended\b\s*/gi, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 function codexModels() {
   const file = path.join(os.homedir(), '.codex', 'models_cache.json');
   let raw = null;
@@ -184,7 +194,7 @@ function codexModels() {
     .filter(m => m && m.slug && m.visibility !== 'hidden')
     .map(m => ({
       id: m.slug,
-      label: m.display_name || m.slug,
+      label: cleanLabel(m.display_name || m.slug),
       description: m.description || '',
       efforts: (m.supported_reasoning_levels || []).map(e => (typeof e === 'string' ? e : e.effort)).filter(Boolean),
       default_effort: m.default_reasoning_level || '',

@@ -24,15 +24,16 @@ type Session struct {
 	// Config, as offered by the Config button. Empty or zero means "leave the
 	// agent's own default alone", except PermMode, whose default is the
 	// full-access mode this gateway is built for.
-	PermMode     string  `json:"perm_mode,omitempty"`     // claude
-	Thinking     int     `json:"thinking,omitempty"`      // claude: maxThinkingTokens
-	MaxTurns     int     `json:"max_turns,omitempty"`     // claude
-	BudgetUSD    float64 `json:"budget_usd,omitempty"`    // claude
-	UserSettings bool    `json:"user_settings,omitempty"` // claude: load ~/.claude
-	Sandbox      string  `json:"sandbox,omitempty"`       // codex
-	Approval     string  `json:"approval,omitempty"`      // codex
-	WebSearch    string  `json:"web_search,omitempty"`    // codex: on | off
-	Network      string  `json:"network,omitempty"`       // codex: on | off
+	PermMode     string  `json:"perm_mode,omitempty"`      // claude
+	Thinking     int     `json:"thinking,omitempty"`       // claude: maxThinkingTokens
+	MaxTurns     int     `json:"max_turns,omitempty"`      // claude
+	BudgetUSD    float64 `json:"budget_usd,omitempty"`     // claude
+	UserSettings bool    `json:"user_settings,omitempty"`  // claude: load ~/.claude
+	Fallback     string  `json:"fallback_model,omitempty"` // claude: switch to this when a message is flagged
+	Sandbox      string  `json:"sandbox,omitempty"`        // codex
+	Approval     string  `json:"approval,omitempty"`       // codex
+	WebSearch    string  `json:"web_search,omitempty"`     // codex: on | off
+	Network      string  `json:"network,omitempty"`        // codex: on | off
 
 	Cost     float64   `json:"cost"`
 	Turns    int       `json:"turns"`

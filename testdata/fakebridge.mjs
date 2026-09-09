@@ -22,7 +22,7 @@ rl.on('line', line => {
             { id: 'gpt-5.5', label: 'GPT-5.5', description: '', efforts: ['low', 'high'], default_effort: 'low' },
           ]
         : [
-            { id: 'default', label: 'Default (recommended)', description: 'opus', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], default_effort: '' },
+            { id: 'default', label: 'Default', description: 'opus', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], default_effort: '' },
             { id: 'sonnet', label: 'Sonnet', description: '', efforts: ['low', 'high'], default_effort: '' },
             { id: 'haiku', label: 'Haiku', description: '', efforts: [], default_effort: '' },
           ];

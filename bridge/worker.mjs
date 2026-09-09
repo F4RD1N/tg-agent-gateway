@@ -28,7 +28,7 @@ function childEnv() {
 
 const s = {
   sid: SID, agent: 'claude', cwd: process.cwd(), model: '', effort: '', ref: '',
-  permMode: '', thinking: 0, maxTurns: 0, budget: 0, userSettings: false,
+  permMode: '', thinking: 0, maxTurns: 0, budget: 0, userSettings: false, fallback: '',
   sandbox: '', approval: '', webSearch: '', network: '',
   queue: [], running: false, abort: null,
 };
@@ -40,6 +40,7 @@ function applyConfig(s, msg) {
   s.maxTurns = msg.max_turns || 0;
   s.budget = msg.budget_usd || 0;
   s.userSettings = !!msg.user_settings;
+  s.fallback = msg.fallback_model || '';
   s.sandbox = msg.sandbox || '';
   s.approval = msg.approval || '';
   s.webSearch = msg.web_search || '';
@@ -75,6 +76,8 @@ async function runClaude(s, text) {
   if (s.thinking > 0) opts.maxThinkingTokens = s.thinking;
   if (s.maxTurns > 0) opts.maxTurns = s.maxTurns;
   if (s.budget > 0) opts.maxBudgetUsd = s.budget;
+  // "Switch models when a message is flagged": retry a refused turn here.
+  if (s.fallback) opts.fallbackModel = s.fallback;
   if (s.ref) opts.resume = s.ref;
 
   const toolNames = new Map();
@@ -126,6 +129,14 @@ async function runClaude(s, text) {
             });
           }
         }
+        break;
+      }
+      case 'compact_boundary': {
+        const pre = m.compact_metadata?.pre_tokens;
+        out({
+          type: 'note', sid: s.sid,
+          message: 'context compacted' + (pre ? ` (was ${Math.round(pre / 1000)}k tokens)` : ''),
+        });
         break;
       }
       case 'result': {

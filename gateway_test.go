@@ -488,8 +488,15 @@ func TestModelListIsPerAgent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claude[0].Label == codex[0].Label {
-		t.Fatalf("both agents returned the same list: %v", claude)
+	ids := func(ms []ModelInfo) string {
+		var out []string
+		for _, m := range ms {
+			out = append(out, m.ID)
+		}
+		return strings.Join(out, ",")
+	}
+	if ids(claude) == ids(codex) {
+		t.Fatalf("both agents returned the same list: %s", ids(claude))
 	}
 	if len(codex) < 2 || len(codex[1].Efforts) == 0 {
 		t.Fatalf("codex models should carry effort levels, got %+v", codex)
@@ -556,6 +563,52 @@ func TestConfigMenu(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("permission mode was not applied: %+v", gw.store.Get(51))
+}
+
+// "Switch models when a message is flagged" offers the agent's own models,
+// and picking one stores it as the fallback model.
+func TestFlaggedFallbackOption(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.store.Put(&Session{ThreadID: 55, Agent: "claude", Cwd: work, Created: time.Now(), LastUsed: time.Now()})
+
+	gw.handleUpdate(msg(55, "/config"))
+	c := f.waitFor(t, "sendMessage", "Claude Code config", 3*time.Second)
+	if !has(buttons(c), "cfg:fallback") {
+		t.Fatalf("config should offer the flagged-message fallback, got %v", buttons(c))
+	}
+	gw.handleUpdate(press(55, 1001, "cfg:fallback"))
+	e := f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "Switch model when flagged", 10*time.Second)
+	b := buttons(e)
+	if !has(b, "cf:fallback:-") || !has(b, "cf:fallback:sonnet") {
+		t.Fatalf("fallback choices should be Off plus the agent's models, got %v", b)
+	}
+	gw.handleUpdate(press(55, 1001, "cf:fallback:sonnet"))
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := gw.store.Get(55); s != nil && s.Fallback == "sonnet" {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("fallback model was not stored: %+v", gw.store.Get(55))
+}
+
+// Model buttons must not carry Claude's "(recommended)" noise.
+func TestModelLabelsAreClean(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.store.Put(&Session{ThreadID: 56, Agent: "claude", Cwd: work, Created: time.Now(), LastUsed: time.Now()})
+	gw.handleUpdate(msg(56, "/model"))
+	c := f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "Model for", 10*time.Second)
+	rm, _ := c.Params["reply_markup"].(map[string]any)
+	rows, _ := rm["inline_keyboard"].([]any)
+	for _, row := range rows {
+		for _, b := range row.([]any) {
+			text, _ := b.(map[string]any)["text"].(string)
+			if strings.Contains(strings.ToLower(text), "recommend") {
+				t.Errorf("model button still says %q", text)
+			}
+		}
+	}
 }
 
 func TestConfigMenuIsAgentSpecific(t *testing.T) {
