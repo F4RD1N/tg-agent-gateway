@@ -20,6 +20,16 @@ type ModelInfo struct {
 	DefaultEffort string   `json:"default_effort"`
 }
 
+// SkillInfo is something the agent can be asked to run by name: a Claude
+// skill or command, a Codex prompt file, an Antigravity skill.
+type SkillInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Hint        string `json:"hint"`
+	Skill       bool   `json:"skill"`
+	Body        string `json:"body,omitempty"` // codex prompts carry their text
+}
+
 // Event is one normalised message from the Node bridge.
 type Event struct {
 	Type    string `json:"type"`
@@ -46,8 +56,9 @@ type Event struct {
 		Done bool   `json:"done"`
 	} `json:"items,omitempty"`
 
-	// models
+	// models and skills
 	Models []ModelInfo `json:"models,omitempty"`
+	Skills []SkillInfo `json:"skills,omitempty"`
 
 	// done
 	Cost       float64 `json:"cost,omitempty"`
@@ -67,28 +78,31 @@ type Command struct {
 	SID    string   `json:"sid,omitempty"`
 	Agent  string   `json:"agent,omitempty"`
 	Cwd    string   `json:"cwd,omitempty"`
-	Model  string   `json:"model,omitempty"`
-	Effort string   `json:"effort,omitempty"`
-	Resume string   `json:"resume,omitempty"`
+	Model  string   `json:"model"`
+	Effort string   `json:"effort"`
+	Resume string   `json:"resume"`
 	Text   string   `json:"text,omitempty"`
 	Images []string `json:"images,omitempty"`
 
-	PermMode     string  `json:"perm_mode,omitempty"`
-	Thinking     int     `json:"thinking,omitempty"`
-	MaxTurns     int     `json:"max_turns,omitempty"`
-	BudgetUSD    float64 `json:"budget_usd,omitempty"`
-	UserSettings bool    `json:"user_settings,omitempty"`
-	Fallback     string  `json:"fallback_model,omitempty"`
+	// Deliberately not omitempty: the worker treats a missing field as "leave
+	// it alone", so an emptied setting - Default model, no effort - would
+	// otherwise never reach it and the old value would stick.
+	PermMode       string  `json:"perm_mode"`
+	Thinking       int     `json:"thinking"`
+	MaxTurns       int     `json:"max_turns"`
+	BudgetUSD      float64 `json:"budget_usd"`
+	NoUserSettings bool    `json:"no_user_settings"`
+	Fallback       string  `json:"fallback_model"`
 
 	// Where this session's files should be delivered.
 	TGChat    string `json:"tg_chat,omitempty"`
 	TGTopic   string `json:"tg_topic,omitempty"`
 	TGToken   string `json:"tg_token,omitempty"`
 	TGTitle   string `json:"tg_title,omitempty"`
-	Sandbox   string `json:"sandbox,omitempty"`
-	Approval  string `json:"approval,omitempty"`
-	WebSearch string `json:"web_search,omitempty"`
-	Network   string `json:"network,omitempty"`
+	Sandbox   string `json:"sandbox"`
+	Approval  string `json:"approval"`
+	WebSearch string `json:"web_search"`
+	Network   string `json:"network"`
 }
 
 // Bridge owns the Node sidecar: one process, many sessions, restarted if it
@@ -166,6 +180,12 @@ func (b *Bridge) spawn() error {
 				continue
 			}
 			b.dispatch(ev)
+		}
+		if err := sc.Err(); err != nil {
+			log.Printf("bridge: reading its output failed (%v); restarting it", err)
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
 		}
 		err := cmd.Wait()
 		b.mu.Lock()

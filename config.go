@@ -30,9 +30,10 @@ type Config struct {
 	ShowThinking    bool `json:"show_thinking"`
 	ShowTools       bool `json:"show_tools"`
 
-	ClaudeModels []Choice `json:"claude_models"`
-	CodexModels  []Choice `json:"codex_models"`
-	CodexEfforts []Choice `json:"codex_efforts"`
+	ClaudeModels      []Choice `json:"claude_models"`
+	CodexModels       []Choice `json:"codex_models"`
+	CodexEfforts      []Choice `json:"codex_efforts"`
+	AntigravityModels []Choice `json:"antigravity_models"`
 
 	path string
 }
@@ -62,6 +63,11 @@ func DefaultConfig() *Config {
 			{ID: "gpt-5.1-codex", Label: "gpt-5.1-codex"},
 			{ID: "gpt-5.1-codex-mini", Label: "codex-mini"},
 		},
+		AntigravityModels: []Choice{
+			{ID: "", Label: "Default"},
+			{ID: "gemini-3.1-pro-high", Label: "Gemini 3.1 Pro (High)"},
+			{ID: "gemini-3.8-flash-high", Label: "Gemini 3.8 Flash (High)"},
+		},
 		CodexEfforts: []Choice{
 			{ID: "", Label: "Default"},
 			{ID: "low", Label: "Low"},
@@ -78,7 +84,7 @@ func LoadConfig(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.ClaudeModels, c.CodexModels, c.CodexEfforts = nil, nil, nil
+	c.ClaudeModels, c.CodexModels, c.CodexEfforts, c.AntigravityModels = nil, nil, nil, nil
 	if err := json.Unmarshal(data, c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
@@ -91,6 +97,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if len(c.CodexEfforts) == 0 {
 		c.CodexEfforts = d.CodexEfforts
+	}
+	if len(c.AntigravityModels) == 0 {
+		c.AntigravityModels = d.AntigravityModels
 	}
 	if c.BotToken == "" {
 		return nil, errors.New("bot_token is required")
@@ -172,9 +181,14 @@ func (c *Config) PathAllowed(p string) bool {
 	return false
 }
 
+// Models is only a fallback for when the agent itself cannot be asked; the
+// live list comes from the agent.
 func (c *Config) Models(agent string) []Choice {
-	if agent == "codex" {
+	switch agent {
+	case "codex":
 		return c.CodexModels
+	case "antigravity":
+		return c.AntigravityModels
 	}
 	return c.ClaudeModels
 }

@@ -29,6 +29,16 @@ rl.on('line', line => {
       out({ type: 'models', sid: m.sid || '', agent, models });
       break;
     }
+    case 'skills': {
+      const agent = m.agent || 'claude';
+      const skills = [];
+      for (let i = 0; i < 14; i++) {
+        skills.push({ name: `${agent}-skill-${i}`, description: 'does thing ' + i, hint: '', skill: i < 3 });
+      }
+      skills.push({ name: 'with-args', description: 'needs arguments', hint: '<file>', skill: false });
+      out({ type: 'skills', sid: m.sid || '', agent, skills });
+      break;
+    }
     case 'start':
     case 'clear':
     case 'stop':

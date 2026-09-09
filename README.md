@@ -1,6 +1,6 @@
 # tg-agent-gateway
 
-Run **Claude Code** and **Codex** from a Telegram group. Each forum topic is
+Run **Claude Code**, **Codex** and **Antigravity** from a Telegram group. Each forum topic is
 one agent session: write in a topic and the agent works there, answering into
 the same message as it streams. Sessions survive restarts, several topics run
 at the same time, and every choice is made with inline ("glass") buttons.
@@ -8,8 +8,8 @@ at the same time, and every choice is made with inline ("glass") buttons.
 ```
 Telegram forum group ──▶ gateway (Go) ──JSONL──▶ bridge (Node)
                               │                     ├─ @anthropic-ai/claude-agent-sdk
-                              └─ topics, buttons     └─ @openai/codex-sdk
-                                 streaming, files
+                              └─ topics, buttons     ├─ @openai/codex-sdk
+                                 streaming, files    └─ agy (Antigravity CLI)
 ```
 
 Written in Go and JavaScript: Go owns Telegram, the topics and the rendering;
@@ -24,9 +24,23 @@ does kill everything that session started.
   and what to call the topic, all on buttons, then creates it. The name you
   give becomes "Claude • VPN App"; the agent stays in front when you rename
   it or switch agents. Send a message in a topic and it goes to that session.
-- **Both agents, full access.** Claude Code runs with `bypassPermissions`,
-  Codex with `danger-full-access` and no approval prompts. Switch a topic
-  between them with a button.
+- **Three agents, full access.** Claude Code runs with `bypassPermissions`,
+  Codex with `danger-full-access` and no approval prompts, Antigravity with
+  `--dangerously-skip-permissions`. Switch a topic between them with a button;
+  each keeps its own conversation and resumes by its own id.
+- **Modes on buttons.** `/mode` offers what the agent supports: accept edits,
+  plan, don't ask, auto, manual, full access.
+- **It recovers from a stopped thread.** Codex sometimes ends a conversation
+  with "chat stopped as a precaution", and that thread can never be resumed.
+  The gateway notices, starts a fresh thread and tells it to pick up the
+  abandoned one's work, so the topic carries on. `/session` shows a topic's
+  conversation id and `/resume <id>` points a topic at any conversation, which
+  is the manual way back.
+- **Skills and plugins.** `/skills` lists what the agent can be told to run by
+  name — Claude's skills, plugin skills and slash commands, Antigravity's
+  skills, Codex's prompt files — and runs it on a tap, asking for arguments
+  when the skill takes them. Claude and Antigravity load the machine's own
+  settings, so the skills and plugins already installed here just work.
 - **The real model list.** The model button asks the agent what it supports
   and shows every model on a button; picking one then offers exactly the
   effort levels that model accepts (low … max, and Codex's ultra).
@@ -67,8 +81,8 @@ does kill everything that session started.
 
 ## Install
 
-Needs a Linux server with systemd, `claude` and `codex` logged in as the user
-the service runs as, and a Telegram **forum** supergroup where the bot is an
+Needs a Linux server with systemd, and whichever agents you want (`claude`,
+`codex`, `agy`) logged in as the user the service runs as, and a Telegram **forum** supergroup where the bot is an
 administrator with *Manage Topics*. In BotFather, set `/setprivacy` to
 **Disabled** so the bot sees plain messages in the group.
 
@@ -103,6 +117,8 @@ In a **topic**:
 |---|---|
 | any message | a prompt for that session |
 | `/model` | the agent's full model list, then its effort levels |
+| `/mode` | accept edits, plan, don't ask, auto, manual |
+| `/skills` | run a skill, plugin command or prompt file |
 | `/config` | permissions, thinking, limits, sandbox — all on buttons |
 | `/agent` | switch between Claude Code and Codex |
 | `/cd` `/pwd` `/ls` | working folder (`/cd` browses with buttons) |
@@ -110,6 +126,7 @@ In a **topic**:
 | `/stop` | interrupt the running turn (or press Stop) |
 | `/kill` | kill the agent process and everything it started |
 | `/clear` | forget the conversation, keep the topic |
+| `/session` `/resume <id>` | show, or take over, a conversation id |
 | `/compact` | compact the agent's context |
 | `/rename <name>` | rename the topic |
 | `/end` | close or delete the topic |
@@ -136,7 +153,7 @@ own commands work too.
 | `edit_interval_ms` | base pacing for live edits; multiplied by the number of streaming topics |
 | `max_message_chars` | where a long answer is sealed and continued in a new message |
 | `show_thinking` `show_tools` | defaults for new sessions |
-| `claude_models` `codex_models` `codex_efforts` | only a fallback: the live list comes from the agent |
+| `claude_models` `codex_models` `antigravity_models` `codex_efforts` | only a fallback: the live list comes from the agent |
 
 ## Command line
 
@@ -160,7 +177,8 @@ session's folder.
 
 ```bash
 go test ./...                                  # fake Telegram + fake bridge, no network
-AGENT_LIVE=1 go test -run TestLiveAgents -v    # real turns against both agents
+go test -race ./...                            # the same, checked for data races
+AGENT_LIVE=1 go test -run TestLiveAgents -v    # real turns against all three agents
 ```
 
 The Go tests run the whole update flow against an in-process Bot API stub, so

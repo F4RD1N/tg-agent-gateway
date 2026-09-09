@@ -17,7 +17,7 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
@@ -34,9 +34,18 @@ function childEnv() {
   return { ...process.env, IS_SANDBOX: '1' };
 }
 
+function agentOf(name) {
+  switch (name) {
+    case 'codex': return 'codex';
+    case 'antigravity': case 'agy': return 'antigravity';
+    default: return 'claude';
+  }
+}
+
 // ---------------------------------------------------------------- workers
 
 const workers = new Map(); // sid -> worker record
+const configs = new Map(); // sid -> the last start command, replayed on respawn
 
 function worker(sid) {
   let w = workers.get(sid);
@@ -50,8 +59,20 @@ function worker(sid) {
     // started (bash, compilers, servers) with it.
     detached: true,
   });
-  const rec = { proc, buf: '', running: false, last: '', config: w?.config || null };
+  const rec = { proc, buf: '', running: false, last: '' };
   workers.set(sid, rec);
+
+  // Decode as text: concatenating raw Buffers splits multi-byte characters
+  // across chunk boundaries and turns them into replacement characters.
+  proc.stdout.setEncoding('utf8');
+  proc.stderr.setEncoding('utf8');
+
+  // A worker that was just spawned starts from nothing, so the session's
+  // settings are replayed into it before anything else.
+  const saved = configs.get(sid);
+  if (saved) {
+    try { proc.stdin.write(JSON.stringify(saved) + '\n'); } catch { /* it will error below */ }
+  }
 
   proc.stdout.on('data', chunk => {
     rec.buf += chunk;
@@ -62,7 +83,7 @@ function worker(sid) {
       if (!line.trim()) continue;
       let ev;
       try { ev = JSON.parse(line); } catch { continue; }
-      if (ev.type === 'idle') { rec.running = false; continue; }
+      if (ev.type === 'idle') rec.running = false;
       if (ev.type === 'started' || ev.type === 'busy') rec.running = true;
       if (ev.type === 'done') rec.running = false;
       if (ev.session) rec.last = ev.session;
@@ -91,14 +112,23 @@ function worker(sid) {
 }
 
 function send(sid, msg) {
+  // Remember the session's settings so a worker that was killed comes back
+  // configured. The gateway sends the whole set with every prompt, so this is
+  // only the safety net for a respawn.
+  if (msg.type === 'start' || msg.type === 'prompt') {
+    // Merge, never replace: a message that leaves a field out means "keep
+    // what you had", so the remembered settings must not be thrown away by a
+    // prompt that only carries the text.
+    const saved = { ...(configs.get(sid) || {}), ...msg, type: 'start' };
+    delete saved.text;
+    delete saved.images;
+    configs.set(sid, saved);
+  }
   const w = worker(sid);
-  if (msg.type === 'start') {
-    w.config = msg;
-  } else if (msg.type === 'prompt' && w.config) {
-    // A worker that was killed and respawned needs its settings back.
-    for (const k of Object.keys(w.config)) {
-      if (k !== 'type' && k !== 'text' && msg[k] === undefined) msg[k] = w.config[k];
-    }
+  if (msg.type === 'prompt') {
+    // Count it as running from the moment it is sent: a turn that has not yet
+    // reported back must not be treated as idle and torn down.
+    w.running = true;
   }
   try {
     w.proc.stdin.write(JSON.stringify(msg) + '\n');
@@ -110,12 +140,15 @@ function send(sid, msg) {
 function killSession(sid, close) {
   const w = workers.get(sid);
   if (!w || !w.proc || w.proc.exitCode !== null) {
-    if (close) workers.delete(sid);
+    if (close) {
+      workers.delete(sid);
+      configs.delete(sid);
+    }
     out({ type: 'killed', sid, message: 'nothing was running' });
     return;
   }
   w.killedOnPurpose = true;
-  w.closing = !!close;
+  if (close) configs.delete(sid);
   try {
     // Negative pid: the whole process group, so the agent's own children die
     // with it instead of being reparented and left behind.
@@ -136,9 +169,29 @@ const MODEL_TTL = 10 * 60 * 1000;
 async function listModels(agent) {
   const hit = modelCache.get(agent);
   if (hit && Date.now() - hit.at < MODEL_TTL) return hit.models;
-  const models = agent === 'codex' ? codexModels() : await claudeModels();
+  let models;
+  if (agent === 'codex') models = codexModels();
+  else if (agent === 'antigravity') models = await agyModels();
+  else models = await claudeModels();
   modelCache.set(agent, { at: Date.now(), models });
   return models;
+}
+
+// Antigravity prints "id<tab>Label" from its own models command, so that is
+// where its list comes from rather than anything hard-coded here.
+function agyModels() {
+  return new Promise(resolve => {
+    execFile('agy', ['models'], { timeout: 60000, env: childEnv() }, (err, stdout) => {
+      const efforts = ['low', 'medium', 'high'];
+      const list = [{ id: '', label: 'Default', description: '', efforts, default_effort: '' }];
+      for (const line of String(stdout || '').split('\n')) {
+        const [id, label] = line.split('\t');
+        if (!id || !label || id.includes(' ')) continue;
+        list.push({ id: id.trim(), label: label.trim(), description: '', efforts, default_effort: '' });
+      }
+      resolve(list);
+    });
+  });
 }
 
 // Claude answers control requests only in streaming-input mode, so this opens
@@ -184,6 +237,177 @@ function cleanLabel(label) {
     .replace(/\s*\brecommended\b\s*/gi, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
+}
+
+// ---------------------------------------------------------------- skills
+//
+// "Skills" means whatever the agent can be asked to run by name: Claude's
+// skills, plugin skills and slash commands, and Codex's custom prompt files.
+
+const skillCache = new Map();
+
+async function listSkills(agent) {
+  const hit = skillCache.get(agent);
+  if (hit && Date.now() - hit.at < MODEL_TTL) return hit.skills;
+  let skills;
+  if (agent === 'codex') skills = codexPrompts();
+  else if (agent === 'antigravity') skills = agySkills();
+  else skills = await claudeSkills();
+  skillCache.set(agent, { at: Date.now(), skills });
+  return skills;
+}
+
+// Antigravity keeps skills as SKILL.md files, the same shape Claude uses, and
+// expands /name in print mode, so listing the directories is enough.
+function agySkills() {
+  const home = os.homedir();
+  const roots = [
+    path.join(home, '.gemini', 'antigravity-cli', 'builtin', 'skills'),
+    path.join(home, '.gemini', 'antigravity-cli', 'skills'),
+    path.join(home, '.antigravity', 'skills'),
+    path.join(home, '.agy', 'skills'),
+  ];
+  const seen = new Map();
+  for (const root of roots) {
+    let entries = [];
+    try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const file = path.join(root, e.name, 'SKILL.md');
+      let body = '';
+      try { body = fs.readFileSync(file, 'utf8'); } catch { continue; }
+      const meta = skillFrontMatter(body);
+      const name = meta.name || e.name;
+      if (seen.has(name)) continue;
+      seen.set(name, {
+        name,
+        description: (meta.description || promptDescription(body)).slice(0, 160),
+        hint: '',
+        skill: true,
+      });
+    }
+  }
+  return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function skillFrontMatter(body) {
+  const fm = body.match(/^---\n([\s\S]*?)\n---/);
+  if (!fm) return {};
+  const out = {};
+  for (const line of fm[1].split('\n')) {
+    const m = line.match(/^(\w+):\s*(.+)$/);
+    if (m) out[m[1]] = m[2].trim();
+  }
+  return out;
+}
+
+async function claudeSkills() {
+  const ac = new AbortController();
+  let release;
+  const gate = new Promise(r => { release = r; });
+  async function* held() { await gate; }
+  const q = query({
+    prompt: held(),
+    options: {
+      cwd: process.cwd(),
+      permissionMode: 'bypassPermissions',
+      allowDangerouslySkipPermissions: true,
+      settingSources: ['user', 'project', 'local'],
+      skills: 'all',
+      abortController: ac,
+      env: childEnv(),
+    },
+  });
+  try {
+    // Ask for the command list directly. Reading the message stream first
+    // would block: nothing is emitted until a prompt is sent.
+    const cmds = await q.supportedCommands();
+    const fromDisk = skillNamesOnDisk();
+    return cmds
+      .filter(c => !HIDDEN_COMMANDS.has(c.name) && !c.name.startsWith('__'))
+      .map(c => ({
+        name: c.name,
+        description: (c.description || '').split('\n')[0].slice(0, 160),
+        hint: c.argumentHint || '',
+        skill: fromDisk.has(c.name),
+      }));
+  } finally {
+    release();
+    try { await q.return?.(); } catch { /* already closed */ }
+    ac.abort();
+  }
+}
+
+// Skills the user installed, or that a plugin brought, live on disk as
+// SKILL.md files. Knowing their names lets the gateway list them first.
+function skillNamesOnDisk() {
+  const home = os.homedir();
+  const names = new Set();
+  const roots = [
+    path.join(home, '.claude', 'skills'),
+    path.join(home, '.claude', 'plugins', 'marketplaces'),
+  ];
+  const walk = (dir, depth) => {
+    if (depth > 5) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        walk(full, depth + 1);
+      } else if (e.name === 'SKILL.md') {
+        const meta = skillFrontMatter(safeRead(full));
+        names.add(meta.name || path.basename(dir));
+      }
+    }
+  };
+  for (const r of roots) walk(r, 0);
+  return names;
+}
+
+function safeRead(file) {
+  try { return fs.readFileSync(file, 'utf8'); } catch { return ''; }
+}
+
+// Commands that only make sense in a terminal, or that the gateway already
+// offers as buttons of its own.
+const HIDDEN_COMMANDS = new Set([
+  'exit', 'quit', 'statusline', 'heapdump', 'color', 'vim', 'terminal-setup',
+  'login', 'logout', 'upgrade', 'bug', 'release-notes', 'help',
+  'model', 'clear', 'resume', 'fast', 'ide', 'install-github-app',
+]);
+
+// Codex has no skills, but it has prompt files, which are the same idea: a
+// named instruction you can run. codex exec does not expand them, so the
+// gateway reads them and sends the text itself.
+function codexPrompts() {
+  const dir = path.join(os.homedir(), '.codex', 'prompts');
+  let names = [];
+  try { names = fs.readdirSync(dir).filter(f => f.endsWith('.md')); } catch { return []; }
+  return names.map(file => {
+    const body = fs.readFileSync(path.join(dir, file), 'utf8');
+    return {
+      name: file.replace(/\.md$/, ''),
+      description: promptDescription(body),
+      hint: /\$ARGUMENTS|\$1/.test(body) ? '[arguments]' : '',
+      skill: true,
+      body,
+    };
+  });
+}
+
+function promptDescription(body) {
+  const fm = body.match(/^---\n([\s\S]*?)\n---/);
+  if (fm) {
+    const d = fm[1].match(/^description:\s*(.+)$/m);
+    if (d) return d[1].trim().slice(0, 160);
+    body = body.slice(fm[0].length);
+  }
+  for (const line of body.split('\n')) {
+    const t = line.replace(/^#+\s*/, '').trim();
+    if (t) return t.slice(0, 160);
+  }
+  return '';
 }
 
 function codexModels() {
@@ -236,9 +460,17 @@ function handle(msg) {
       break;
     case 'models': {
       pendingWork++;
-      listModels(msg.agent === 'codex' ? 'codex' : 'claude')
-        .then(models => out({ type: 'models', sid: msg.sid || '', agent: msg.agent || 'claude', models }))
+      listModels(agentOf(msg.agent))
+        .then(models => out({ type: 'models', sid: msg.sid || '', agent: agentOf(msg.agent), models }))
         .catch(err => out({ type: 'error', sid: msg.sid || '', message: 'models: ' + String(err?.message || err) }))
+        .finally(() => { pendingWork--; });
+      break;
+    }
+    case 'skills': {
+      pendingWork++;
+      listSkills(agentOf(msg.agent))
+        .then(skills => out({ type: 'skills', sid: msg.sid || '', agent: agentOf(msg.agent), skills }))
+        .catch(err => out({ type: 'error', sid: msg.sid || '', message: 'skills: ' + String(err?.message || err) }))
         .finally(() => { pendingWork--; });
       break;
     }

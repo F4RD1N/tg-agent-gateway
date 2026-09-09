@@ -565,7 +565,7 @@ func TestConfigMenu(t *testing.T) {
 	gw.handleUpdate(msg(51, "/config"))
 	c := f.waitFor(t, "sendMessage", "Claude Code config", 3*time.Second)
 	b := buttons(c)
-	for _, want := range []string{"cfg:perm", "cfg:think", "cfg:turns", "cfg:budget", "cfg:usercfg", "cfg:back"} {
+	for _, want := range []string{"cfg:perm", "cfg:think", "cfg:turns", "cfg:budget", "cfg:back"} {
 		if !has(b, want) {
 			t.Errorf("config menu is missing %q (got %v)", want, b)
 		}
@@ -575,7 +575,7 @@ func TestConfigMenu(t *testing.T) {
 	}
 
 	gw.handleUpdate(press(51, 1001, "cfg:perm"))
-	e := f.waitFor(t, "editMessageText", "Permissions", 3*time.Second)
+	e := f.waitFor(t, "editMessageText", "Mode", 3*time.Second)
 	if !has(buttons(e), "cf:perm:plan") {
 		t.Fatalf("permission choices should be buttons, got %v", buttons(e))
 	}
@@ -634,6 +634,80 @@ func TestModelLabelsAreClean(t *testing.T) {
 			}
 		}
 	}
+}
+
+// /mode puts the permission modes straight on buttons, in the words the CLI
+// uses for them.
+func TestModeCommandShowsButtons(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.store.Put(&Session{ThreadID: 57, Agent: "claude", Cwd: work, Created: time.Now(), LastUsed: time.Now()})
+	gw.handleUpdate(msg(57, "/mode"))
+	c := f.waitFor(t, "sendMessage", "Mode", 3*time.Second)
+	b := buttons(c)
+	for _, want := range []string{"cf:perm:acceptEdits", "cf:perm:plan", "cf:perm:dontAsk", "cf:perm:auto", "cf:perm:default"} {
+		if !has(b, want) {
+			t.Errorf("/mode is missing %q (got %v)", want, b)
+		}
+	}
+	gw.handleUpdate(press(57, 1001, "cf:perm:acceptEdits"))
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := gw.store.Get(57); s != nil && s.PermMode == "acceptEdits" {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("mode was not applied: %+v", gw.store.Get(57))
+}
+
+// Antigravity is a first-class agent: it can be chosen, named and configured.
+func TestAntigravityIsAnAgent(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.handleUpdate(msg(0, "/new"))
+	c := f.waitFor(t, "sendMessage", "Which agent?", 3*time.Second)
+	if !has(buttons(c), "new:agent:antigravity") {
+		t.Fatalf("the agent picker should offer Antigravity, got %v", buttons(c))
+	}
+	if got := topicTitle("antigravity", "VPN App"); got != "Antigravity • VPN App" {
+		t.Errorf("topicTitle = %q", got)
+	}
+	if agentLabel("antigravity") != "Antigravity" {
+		t.Errorf("agentLabel = %q", agentLabel("antigravity"))
+	}
+	gw.store.Put(&Session{ThreadID: 58, Agent: "antigravity", Cwd: work, Created: time.Now(), LastUsed: time.Now()})
+	gw.handleUpdate(msg(58, "/config"))
+	cfgMsg := f.waitFor(t, "sendMessage", "Antigravity config", 3*time.Second)
+	cb := buttons(cfgMsg)
+	if !has(cb, "cfg:perm") {
+		t.Errorf("antigravity config should offer the mode, got %v", cb)
+	}
+	if has(cb, "cfg:sandbox") || has(cb, "cfg:budget") {
+		t.Errorf("antigravity config should not carry another agent's options: %v", cb)
+	}
+}
+
+// Skills are listed on buttons and run by name.
+func TestSkillsMenu(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.store.Put(&Session{ThreadID: 59, Agent: "claude", Cwd: work, Created: time.Now(), LastUsed: time.Now()})
+	gw.handleUpdate(msg(59, "/skills"))
+	c := f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "claude-skill-0", 10*time.Second)
+	b := buttons(c)
+	if !has(b, "sk:0") {
+		t.Fatalf("skills should be buttons, got %v", b)
+	}
+	if !has(b, "skp:1") {
+		t.Errorf("a long list should paginate, got %v", b)
+	}
+	gw.handleUpdate(press(59, 1001, "sk:0"))
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := gw.store.Get(59); s != nil && s.Turns == 1 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("the skill never ran")
 }
 
 func TestConfigMenuIsAgentSpecific(t *testing.T) {

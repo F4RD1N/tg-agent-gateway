@@ -162,7 +162,7 @@ func cmdCheck(path string) error {
 	fmt.Printf("users:    %v\n", cfg.AllowedUserIDs)
 	fmt.Printf("roots:    %v (default %s)\n", cfg.WorkspaceRoots, cfg.DefaultCwd)
 
-	for _, bin := range []string{"claude", "codex", "node"} {
+	for _, bin := range []string{"claude", "codex", "agy", "node"} {
 		if p, err := exec.LookPath(bin); err == nil {
 			fmt.Printf("%-9s %s\n", bin+":", p)
 		} else {

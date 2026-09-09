@@ -5,6 +5,7 @@ import (
 	"html"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,8 @@ Each topic in this group is one agent session. Write a message in a topic and it
 
 <b>This topic</b>
 /model /agent /effort — pick with buttons
+/mode — accept edits, plan, auto, manual…
+/skills — run a skill or command
 /config — permissions, thinking, limits, sandbox
 /cd /pwd /ls — working folder
 /get &lt;file&gt; — send me a file
@@ -30,6 +33,8 @@ Each topic in this group is one agent session. Write a message in a topic and it
 /stop — interrupt the current turn
 /kill — kill the agent and everything it started
 /clear — forget the conversation, keep the topic
+/session — show this topic's conversation id
+/resume &lt;id&gt; — continue another conversation here
 /compact — ask the agent to compact its context
 /status — what this session is
 /verbose — show tool output and thinking
@@ -51,6 +56,32 @@ func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 		gw.cmdNew(thread, arg)
 	case "sessions", "list":
 		gw.cmdSessions(thread)
+	case "session", "id-session":
+		gw.needSession(thread, sess, func(s *Session) {
+			id := s.Ref
+			if id == "" {
+				gw.reply(thread, "This topic has no conversation yet. Send a message and one starts.", nil)
+				return
+			}
+			gw.reply(thread, "🧵 <b>"+agentLabel(s.Agent)+"</b> conversation\n<code>"+html.EscapeString(id)+"</code>\n\n"+
+				"Point another topic at it with <code>/resume "+html.EscapeString(id)+"</code>.", nil)
+		})
+	case "resume", "attach":
+		gw.needSession(thread, sess, func(s *Session) {
+			if arg == "" {
+				gw.reply(thread, "Usage: <code>/resume &lt;conversation id&gt;</code>\nUse <code>/session</code> to see this topic's own id.", nil)
+				return
+			}
+			if gw.busyHere(thread) {
+				return
+			}
+			id := strings.Fields(arg)[0]
+			ns := gw.store.Update(thread, func(x *Session) { x.Ref = id })
+			if ns == nil {
+				return
+			}
+			gw.reply(thread, "🧵 this topic now continues <code>"+html.EscapeString(id)+"</code>.\nSend a message to pick it up.", gw.sessionKeyboard(ns))
+		})
 	case "compact":
 		gw.needSession(thread, sess, func(s *Session) {
 			text := "/compact"
@@ -75,11 +106,19 @@ func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 		gw.needSession(thread, sess, func(s *Session) { gw.showEfforts(thread, s, 0) })
 	case "agent":
 		gw.needSession(thread, sess, func(s *Session) { gw.showAgents(thread, s, 0) })
+	case "skills", "skill":
+		gw.needSession(thread, sess, func(s *Session) { gw.showSkills(thread, 0, s, 0) })
+	case "mode":
+		gw.needSession(thread, sess, func(s *Session) { gw.showConfigChoice(thread, 0, s, "perm") })
 	case "config", "settings":
 		gw.needSession(thread, sess, func(s *Session) { gw.showConfig(thread, 0, s) })
 	case "verbose":
 		gw.needSession(thread, sess, func(s *Session) {
 			ns := gw.store.Update(thread, func(x *Session) { x.Verbose = !x.Verbose })
+			// The topic may have been ended while this menu was open.
+			if ns == nil {
+				return
+			}
 			gw.reply(thread, "Tool output and thinking: <b>"+onOff(ns.Verbose)+"</b>", gw.sessionKeyboard(ns))
 		})
 	case "clear":
@@ -177,14 +216,14 @@ type configOption struct {
 func configOptions() []configOption {
 	return []configOption{
 		{
-			Key: "perm", Icon: "🔓", Label: "Permissions", Agent: "claude",
+			Key: "perm", Icon: "🔓", Label: "Mode", Agent: "claude",
 			Choices: []Choice{
 				{ID: "bypassPermissions", Label: "Full access"},
 				{ID: "acceptEdits", Label: "Accept edits"},
-				{ID: "plan", Label: "Plan only"},
-				{ID: "default", Label: "Ask first"},
+				{ID: "plan", Label: "Plan mode"},
 				{ID: "dontAsk", Label: "Don't ask"},
-				{ID: "auto", Label: "Auto"},
+				{ID: "auto", Label: "Auto mode"},
+				{ID: "default", Label: "Manual mode"},
 			},
 			Current: func(s *Session) string {
 				if s.PermMode == "" {
@@ -242,18 +281,35 @@ func configOptions() []configOption {
 			Apply:   func(s *Session, v string) { s.Fallback = v },
 		},
 		{
-			Key: "usercfg", Icon: "📚", Label: "Load ~/.claude settings", Agent: "claude",
+			// Loads settings.json, CLAUDE.md and the machine's own
+			// configuration. Skills are enabled either way.
+			Key: "usercfg", Icon: "📚", Label: "Use ~/.claude settings", Agent: "claude",
 			Choices: []Choice{
+				{ID: "on", Label: "Use them"},
 				{ID: "off", Label: "Ignore them"},
-				{ID: "on", Label: "Load them"},
 			},
 			Current: func(s *Session) string {
-				if s.UserSettings {
-					return "on"
+				if s.NoUserSettings {
+					return "off"
 				}
-				return "off"
+				return "on"
 			},
-			Apply: func(s *Session, v string) { s.UserSettings = v == "on" },
+			Apply: func(s *Session, v string) { s.NoUserSettings = v == "off" },
+		},
+		{
+			Key: "perm", Icon: "🔓", Label: "Mode", Agent: "antigravity",
+			Choices: []Choice{
+				{ID: "bypassPermissions", Label: "Full access"},
+				{ID: "acceptEdits", Label: "Accept edits"},
+				{ID: "plan", Label: "Plan mode"},
+			},
+			Current: func(s *Session) string {
+				if s.PermMode == "" {
+					return "bypassPermissions"
+				}
+				return s.PermMode
+			},
+			Apply: func(s *Session, v string) { s.PermMode = v },
 		},
 		{
 			Key: "sandbox", Icon: "🏖", Label: "Sandbox", Agent: "codex",
@@ -371,7 +427,7 @@ func (gw *Gateway) showConfigChoice(thread, editMsg int, sess *Session, key stri
 	}
 	if key == "fallback" {
 		// The choices are the agent's own models, so they are fetched.
-		go func() {
+		guard("fallback menu", func() {
 			models, err := gw.fetchModels(sess.Agent)
 			if err != nil {
 				models = gw.fallbackModels(sess.Agent)
@@ -387,7 +443,7 @@ func (gw *Gateway) showConfigChoice(thread, editMsg int, sess *Session, key stri
 			opt.Choices = choices
 			gw.renderConfigChoice(thread, editMsg, sess, &opt,
 				"Retry on another model when a message is flagged.")
-		}()
+		})
 		return
 	}
 	gw.renderConfigChoice(thread, editMsg, sess, o, "")
@@ -423,6 +479,19 @@ func (gw *Gateway) askEnd(thread int) {
 		[]Button{{Text: "🗑 Delete the topic", CallbackData: "end:delete"}},
 		[]Button{{Text: "Cancel", CallbackData: "dismiss"}},
 	))
+}
+
+// busyHere reports whether a turn is running in this topic, and says so.
+func (gw *Gateway) busyHere(thread int) bool {
+	gw.mu.Lock()
+	running := gw.running[thread]
+	gw.mu.Unlock()
+	if running {
+		gw.reply(thread, "⏳ That would change the session while it is working. Stop it first.", Rows(
+			[]Button{{Text: "⏹ Stop", CallbackData: "stop"}, {Text: "💀 Kill", CallbackData: "kill"}},
+		))
+	}
+	return running
 }
 
 func (gw *Gateway) needSession(thread int, sess *Session, fn func(*Session)) {
@@ -468,9 +537,7 @@ func resolvePath(base, p string) string {
 func (gw *Gateway) cmdNew(thread int, arg string) {
 	agent, path, name := parseNewArgs(arg)
 	if agent == "" {
-		m := gw.reply(thread, "Which agent?", Rows(
-			[]Button{{Text: "🟠 Claude Code", CallbackData: "new:agent:claude"}, {Text: "🟢 Codex", CallbackData: "new:agent:codex"}},
-		))
+		m := gw.reply(thread, "Which agent?", agentPicker("new:agent:"))
 		if m != nil {
 			gw.rememberMenu(m.MessageID, &pending{kind: "newagent", name: name, threadID: thread})
 		}
@@ -497,6 +564,9 @@ func parseNewArgs(arg string) (agent, path, name string) {
 			continue
 		case "codex", "cx":
 			agent = "codex"
+			continue
+		case "antigravity", "agy", "gemini":
+			agent = "antigravity"
 			continue
 		}
 		if path == "" && looksLikePath(f) {
@@ -562,6 +632,108 @@ func (gw *Gateway) notify(thread, editMsg int, text string, kb ...*Keyboard) {
 		}
 	}
 	gw.reply(thread, text, k)
+}
+
+// showSkills lists what this agent can be told to run by name: Claude's
+// skills and commands, Codex's prompt files, Antigravity's skills. Long lists
+// are paged, because a phone keyboard of sixty buttons helps nobody.
+const skillsPerPage = 10
+
+func (gw *Gateway) showSkills(thread, editMsg int, sess *Session, page int) {
+	msgID := editMsg
+	if msgID == 0 {
+		if m := gw.reply(thread, "⏳ asking "+agentLabel(sess.Agent)+" for its skills…", nil); m != nil {
+			msgID = m.MessageID
+		}
+	}
+	guard("skill menu", func() {
+		skills, err := gw.fetchSkills(sess.Agent)
+		if err != nil {
+			gw.notify(thread, msgID, "⚠️ "+html.EscapeString(err.Error()))
+			return
+		}
+		if len(skills) == 0 {
+			gw.notify(thread, msgID, skillsEmptyText(sess.Agent))
+			return
+		}
+		// Skills the user installed come first; the rest follow.
+		sort.SliceStable(skills, func(i, j int) bool {
+			if skills[i].Skill != skills[j].Skill {
+				return skills[i].Skill
+			}
+			return skills[i].Name < skills[j].Name
+		})
+		pages := (len(skills) + skillsPerPage - 1) / skillsPerPage
+		if page < 0 {
+			page = pages - 1
+		}
+		if page >= pages {
+			page = 0
+		}
+		start := page * skillsPerPage
+		end := start + skillsPerPage
+		if end > len(skills) {
+			end = len(skills)
+		}
+		var buttons []Button
+		for i := start; i < end; i++ {
+			label := skills[i].Name
+			if skills[i].Skill {
+				label = "🧩 " + label
+			}
+			buttons = append(buttons, Button{Text: truncate(label, 32), CallbackData: "sk:" + strconv.Itoa(i)})
+		}
+		kb := Grid(2, buttons)
+		if pages > 1 {
+			kb.InlineKeyboard = append(kb.InlineKeyboard, []Button{
+				{Text: "‹ Back", CallbackData: "skp:" + strconv.Itoa(page-1)},
+				{Text: fmt.Sprintf("%d/%d ›", page+1, pages), CallbackData: "skp:" + strconv.Itoa(page+1)},
+			})
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "<b>%s can run:</b>\n", agentLabel(sess.Agent))
+		for i := start; i < end; i++ {
+			b.WriteString("\n<b>/" + html.EscapeString(skills[i].Name) + "</b>")
+			if skills[i].Description != "" {
+				b.WriteString(" — " + html.EscapeString(truncate(skills[i].Description, 90)))
+			}
+		}
+		gw.rememberMenu(msgID, &pending{kind: "skills", agent: sess.Agent, skills: skills, page: page, threadID: thread})
+		gw.notify(thread, msgID, b.String(), kb)
+	})
+}
+
+func skillsEmptyText(agent string) string {
+	switch agent {
+	case "codex":
+		return "Codex has no prompt files yet.\nPut a <code>name.md</code> in <code>~/.codex/prompts/</code> and it shows up here."
+	case "antigravity":
+		return "Antigravity has no skills yet.\nAdd one as <code>~/.gemini/antigravity-cli/skills/&lt;name&gt;/SKILL.md</code>."
+	}
+	return "No skills or commands were reported.\nAdd one as <code>~/.claude/skills/&lt;name&gt;/SKILL.md</code>."
+}
+
+// runSkill sends the skill to the agent. Claude and Antigravity expand a
+// leading slash themselves; Codex does not, so its prompt file is read and
+// sent as the text it contains.
+func (gw *Gateway) runSkill(thread int, sess *Session, sk SkillInfo, args string) {
+	text := "/" + sk.Name
+	if args != "" {
+		text += " " + args
+	}
+	if sess.Agent == "codex" && sk.Body != "" {
+		body := sk.Body
+		if i := strings.Index(body, "\n---\n"); strings.HasPrefix(body, "---\n") && i > 0 {
+			body = body[i+5:]
+		}
+		body = strings.ReplaceAll(body, "$ARGUMENTS", args)
+		body = strings.ReplaceAll(body, "$1", args)
+		text = strings.TrimSpace(body)
+		if args != "" && !strings.Contains(sk.Body, "$ARGUMENTS") && !strings.Contains(sk.Body, "$1") {
+			text += "\n\n" + args
+		}
+	}
+	gw.submit(sess, text)
 }
 
 // askTopicName is the last step of creating a session: what the topic should
@@ -647,7 +819,7 @@ func (gw *Gateway) showModels(thread int, sess *Session, editMsg int) {
 	} else if m := gw.reply(thread, "⏳ asking "+agentLabel(sess.Agent)+" for its models…", nil); m != nil {
 		msgID = m.MessageID
 	}
-	go func() {
+	guard("model menu", func() {
 		models, err := gw.fetchModels(sess.Agent)
 		if err != nil {
 			logf("model list for %s: %v", sess.Agent, err)
@@ -677,12 +849,12 @@ func (gw *Gateway) showModels(thread int, sess *Session, editMsg int) {
 		if m := gw.reply(thread, title, kb); m != nil {
 			gw.rememberMenu(m.MessageID, &pending{kind: "model", agent: sess.Agent, models: models, threadID: thread})
 		}
-	}()
+	})
 }
 
 // showEfforts offers the levels the chosen model actually accepts.
 func (gw *Gateway) showEfforts(thread int, sess *Session, editMsg int) {
-	go func() {
+	guard("effort menu", func() {
 		models, err := gw.fetchModels(sess.Agent)
 		if err != nil {
 			gw.notify(thread, editMsg, "⚠️ "+html.EscapeString(err.Error()))
@@ -700,7 +872,7 @@ func (gw *Gateway) showEfforts(thread int, sess *Session, editMsg int) {
 			return
 		}
 		gw.presentEfforts(thread, editMsg, sess, models, idx)
-	}()
+	})
 }
 
 // presentEfforts is the second step of the picker: the levels for one model.
@@ -742,16 +914,30 @@ func (gw *Gateway) presentEfforts(thread, editMsg int, sess *Session, models []M
 	gw.rememberMenu(sent.MessageID, &pending{kind: "effort", agent: sess.Agent, models: models, modelIdx: idx, threadID: thread})
 }
 
-func (gw *Gateway) showAgents(thread int, sess *Session, editMsg int) {
-	claude, codex := "🟠 Claude Code", "🟢 Codex"
-	if sess.Agent == "claude" {
-		claude = "✓ " + claude
-	} else {
-		codex = "✓ " + codex
+// agentPicker is the one list of agents, so adding one shows up everywhere.
+func agentPicker(prefix string, current ...string) *Keyboard {
+	cur := ""
+	if len(current) > 0 {
+		cur = current[0]
 	}
-	gw.notify(thread, editMsg, "Which agent runs in this topic?\nSwitching starts a fresh conversation.", Rows(
-		[]Button{{Text: claude, CallbackData: "agt:claude"}, {Text: codex, CallbackData: "agt:codex"}},
-	))
+	var buttons []Button
+	for _, a := range []struct{ id, label string }{
+		{"claude", "🟠 Claude Code"},
+		{"codex", "🟢 Codex"},
+		{"antigravity", "🟣 Antigravity"},
+	} {
+		label := a.label
+		if a.id == cur {
+			label = "✓ " + label
+		}
+		buttons = append(buttons, Button{Text: label, CallbackData: prefix + a.id})
+	}
+	return Grid(2, buttons)
+}
+
+func (gw *Gateway) showAgents(thread int, sess *Session, editMsg int) {
+	gw.notify(thread, editMsg, "Which agent runs in this topic?\nSwitching starts a fresh conversation.",
+		agentPicker("agt:", sess.Agent))
 }
 
 func (gw *Gateway) cmdSessions(thread int) {
@@ -763,6 +949,12 @@ func (gw *Gateway) cmdSessions(thread int) {
 	var b strings.Builder
 	var buttons []Button
 	b.WriteString("<b>Sessions</b>\n")
+	const maxListed = 20
+	extra := 0
+	if len(list) > maxListed {
+		extra = len(list) - maxListed
+		list = list[:maxListed]
+	}
 	for _, s := range list {
 		b.WriteString(fmt.Sprintf("\n• <b>%s</b> — <code>%s</code>", agentLabel(s.Agent), html.EscapeString(s.Cwd)))
 		if s.Turns > 0 {
@@ -772,6 +964,9 @@ func (gw *Gateway) cmdSessions(thread int) {
 			Text: agentLabel(s.Agent) + " · " + filepath.Base(s.Cwd),
 			URL:  TopicLink(gw.cfg.ChatID, s.ThreadID),
 		})
+	}
+	if extra > 0 {
+		fmt.Fprintf(&b, "\n\n<i>and %d older ones</i>", extra)
 	}
 	kb := Grid(1, buttons)
 	kb.InlineKeyboard = append(kb.InlineKeyboard, []Button{{Text: "✨ New session", CallbackData: "new"}})
@@ -823,10 +1018,13 @@ func (gw *Gateway) setCwd(thread int, sess *Session, arg string) {
 			s.Title = topicTitle(s.Agent, s.Name)
 		}
 	})
+	// The topic may have been ended while this menu was open.
+	if ns == nil {
+		return
+	}
 	if ns.AutoName {
 		_ = gw.tg.EditTopic(gw.ctx, gw.cfg.ChatID, thread, ns.Title)
 	}
-	_ = gw.bridge.Send(gw.command("start", ns, ""))
 	gw.reply(thread, "📁 now <code>"+html.EscapeString(p)+"</code>", gw.sessionKeyboard(ns))
 }
 
@@ -852,12 +1050,25 @@ func (gw *Gateway) finishPathEntry(p *pending, text string, thread int) {
 			return
 		}
 		gw.setCwd(p.threadID, sess, text)
+	case "skillargs":
+		sess := gw.store.Get(p.threadID)
+		if sess == nil || len(p.skills) == 0 {
+			return
+		}
+		if text == "-" {
+			text = ""
+		}
+		gw.runSkill(p.threadID, sess, p.skills[0], text)
 	case "model":
 		sess := gw.store.Get(p.threadID)
 		if sess == nil {
 			return
 		}
 		ns := gw.store.Update(p.threadID, func(s *Session) { s.Model = text })
+		// The topic may have been ended while this menu was open.
+		if ns == nil {
+			return
+		}
 		gw.reply(p.threadID, "🧠 model: <b>"+html.EscapeString(text)+"</b>", gw.sessionKeyboard(ns))
 	}
 }
@@ -899,9 +1110,7 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 	case "new":
 		if arg == "" {
 			ack("")
-			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, "Which agent?", Rows(
-				[]Button{{Text: "🟠 Claude Code", CallbackData: "new:agent:claude"}, {Text: "🟢 Codex", CallbackData: "new:agent:codex"}},
-			))
+			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, "Which agent?", agentPicker("new:agent:"))
 			return
 		}
 		if strings.HasPrefix(arg, "agent:") {
@@ -948,6 +1157,43 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 			gw.showDirs(thread, p.dirs[i], head, p.agent, p.name, msgID)
 		}
 
+	case "skp":
+		p := gw.menu(msgID)
+		if p == nil || sess == nil {
+			ack("That menu expired.")
+			return
+		}
+		page, err := strconv.Atoi(arg)
+		if err != nil {
+			ack("")
+			return
+		}
+		ack("")
+		gw.showSkills(thread, msgID, sess, page)
+
+	case "sk":
+		p := gw.menu(msgID)
+		if p == nil || sess == nil {
+			ack("That menu expired.")
+			return
+		}
+		i, err := strconv.Atoi(arg)
+		if err != nil || i < 0 || i >= len(p.skills) {
+			ack("")
+			return
+		}
+		sk := p.skills[i]
+		if sk.Hint != "" {
+			ack("It takes arguments")
+			gw.awaitPath(cq.From.ID, &pending{kind: "skillargs", agent: sess.Agent, skills: []SkillInfo{sk}, threadID: thread})
+			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID,
+				"<b>/"+html.EscapeString(sk.Name)+"</b> takes <code>"+html.EscapeString(sk.Hint)+"</code>.\nSend them as a message, or send <code>-</code> to run it without.", nil)
+			return
+		}
+		ack("Running /" + sk.Name)
+		_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, "▶️ <b>/"+html.EscapeString(sk.Name)+"</b>", nil)
+		gw.runSkill(thread, sess, sk, "")
+
 	case "newname":
 		p := gw.menu(msgID)
 		if p == nil || len(p.dirs) == 0 {
@@ -990,6 +1236,14 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 		ack("Killing the processes…")
 		gw.cmdKill(thread)
 
+	case "skills":
+		if sess == nil {
+			ack("No session.")
+			return
+		}
+		ack("")
+		gw.showSkills(thread, 0, sess, 0)
+
 	case "model":
 		if sess == nil {
 			ack("No session.")
@@ -1030,6 +1284,10 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 				s.Effort = ""
 			}
 		})
+		// The topic may have been ended while this menu was open.
+		if ns == nil {
+			return
+		}
 		ack(chosen.Label)
 		if len(chosen.Efforts) > 0 {
 			gw.presentEfforts(thread, msgID, ns, p.models, i)
@@ -1052,6 +1310,10 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 		}
 		if arg == "none" {
 			ns := gw.store.Update(thread, func(s *Session) { s.Effort = "" })
+			// The topic may have been ended while this menu was open.
+			if ns == nil {
+				return
+			}
 			ack("Default effort")
 			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, gw.sessionHeader(ns), gw.sessionKeyboard(ns))
 			return
@@ -1070,6 +1332,10 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 		}
 		e := efforts[i]
 		ns := gw.store.Update(thread, func(s *Session) { s.Effort = e })
+		// The topic may have been ended while this menu was open.
+		if ns == nil {
+			return
+		}
 		ack(e)
 		_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, gw.sessionHeader(ns), gw.sessionKeyboard(ns))
 
@@ -1086,8 +1352,12 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 			ack("No session.")
 			return
 		}
-		if arg != "claude" && arg != "codex" {
+		if arg != "claude" && arg != "codex" && arg != "antigravity" {
 			ack("")
+			return
+		}
+		if gw.busyHere(thread) {
+			ack("It is still working")
 			return
 		}
 		ns := gw.store.Update(thread, func(s *Session) {
@@ -1097,7 +1367,10 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 				s.Model = ""
 			}
 		})
-		_ = gw.bridge.Send(Command{Type: "start", SID: sidOf(thread), Agent: ns.Agent, Cwd: ns.Cwd})
+		// The topic may have been ended while this menu was open.
+		if ns == nil {
+			return
+		}
 		ack(agentLabel(arg))
 		_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, gw.sessionHeader(ns), gw.sessionKeyboard(ns))
 		// The topic keeps the name you chose; only the agent in front changes.
@@ -1142,7 +1415,13 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 			return
 		}
 		ns := gw.store.Update(thread, func(s *Session) { o.Apply(s, val) })
-		_ = gw.bridge.Send(gw.command("start", ns, ""))
+		// The topic may have been ended while this menu was open.
+		if ns == nil {
+			return
+		}
+		// Nothing is sent to the agent here: every prompt carries the whole
+		// configuration, so the change lands on the next turn without
+		// disturbing one that may be running now.
 		ack(o.Label + ": " + choiceLabel(o, ns))
 		gw.showConfig(thread, msgID, ns)
 
@@ -1152,6 +1431,10 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 			return
 		}
 		ns := gw.store.Update(thread, func(s *Session) { s.Verbose = !s.Verbose })
+		// The topic may have been ended while this menu was open.
+		if ns == nil {
+			return
+		}
 		ack("Details " + onOff(ns.Verbose))
 		_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, gw.sessionHeader(ns), gw.sessionKeyboard(ns))
 
@@ -1165,6 +1448,10 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 			gw.reply(thread, "Start a fresh conversation in this topic?", Rows(
 				[]Button{{Text: "🧹 Yes", CallbackData: "clear:yes"}, {Text: "Cancel", CallbackData: "dismiss"}},
 			))
+			return
+		}
+		if gw.busyHere(thread) {
+			ack("It is still working")
 			return
 		}
 		gw.store.Update(thread, func(s *Session) { s.Ref = "" })

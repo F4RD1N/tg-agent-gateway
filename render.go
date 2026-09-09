@@ -117,8 +117,11 @@ func (gw *Gateway) NewTurn(sess *Session) *Turn {
 }
 
 func agentLabel(agent string) string {
-	if agent == "codex" {
+	switch agent {
+	case "codex":
 		return "Codex"
+	case "antigravity":
+		return "Antigravity"
 	}
 	return "Claude Code"
 }
@@ -327,12 +330,16 @@ func splitHTML(s string, max int) (head, tail string) {
 			break
 		}
 	}
-	for depth := 0; depth < 1; depth++ {
-		seg := string(r[:cut])
-		if strings.Count(seg, "<") != strings.Count(seg, ">") {
-			for cut > 0 && r[cut-1] != '>' {
-				cut--
-			}
+	seg := string(r[:cut])
+	if strings.Count(seg, "<") != strings.Count(seg, ">") {
+		back := cut
+		for back > 0 && r[back-1] != '>' {
+			back--
+		}
+		// Only take the earlier cut if it still leaves something to send;
+		// otherwise the message would never shrink and Flush would spin.
+		if back > 0 {
+			cut = back
 		}
 	}
 	head = string(r[:cut])

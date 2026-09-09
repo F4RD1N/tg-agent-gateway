@@ -17,6 +17,19 @@ import (
 
 func logf(format string, args ...any) { log.Printf(format, args...) }
 
+// guard runs fn on its own goroutine and keeps a panic in it from taking the
+// gateway - and every other topic - down with it.
+func guard(what string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logf("panic in %s: %v", what, r)
+			}
+		}()
+		fn()
+	}()
+}
+
 // pending remembers what a menu message is offering, so a button press can
 // carry a short index instead of a long path.
 type pending struct {
@@ -25,6 +38,8 @@ type pending struct {
 	name     string // topic name the user asked for with "/new Name"
 	dirs     []string
 	models   []ModelInfo
+	skills   []SkillInfo
+	page     int
 	modelIdx int
 	threadID int
 	expires  time.Time
@@ -33,6 +48,11 @@ type pending struct {
 type modelCacheEntry struct {
 	at     time.Time
 	models []ModelInfo
+}
+
+type skillCacheEntry struct {
+	at     time.Time
+	skills []SkillInfo
 }
 
 type Gateway struct {
@@ -44,11 +64,11 @@ type Gateway struct {
 	me     *TGUser
 
 	mu       sync.Mutex
-	turns    map[int]*Turn
 	running  map[int]bool
 	menus    map[int]*pending
 	awaitTP  map[int64]*pending // user id -> "send me a path" state
 	modelsBy map[string]modelCacheEntry
+	skillsBy map[string]skillCacheEntry
 	albums   map[string]*album
 	reqSeq   int64
 }
@@ -67,9 +87,10 @@ func NewGateway(ctx context.Context, cfg *Config, store *Store) *Gateway {
 	return &Gateway{
 		cfg: cfg, tg: NewTelegram(cfg.APIBase, cfg.BotToken), store: store,
 		bridge: NewBridge(cfg.BridgeCmd), ctx: ctx,
-		turns: map[int]*Turn{}, running: map[int]bool{},
-		menus: map[int]*pending{}, awaitTP: map[int64]*pending{},
+		running: map[int]bool{},
+		menus:   map[int]*pending{}, awaitTP: map[int64]*pending{},
 		modelsBy: map[string]modelCacheEntry{},
+		skillsBy: map[string]skillCacheEntry{},
 		albums:   map[string]*album{},
 	}
 }
@@ -83,7 +104,7 @@ func (gw *Gateway) command(kind string, sess *Session, text string) Command {
 		Type: kind, SID: sidOf(sess.ThreadID), Agent: sess.Agent, Cwd: sess.Cwd,
 		Model: sess.Model, Effort: sess.Effort, Resume: sess.Ref, Text: text,
 		PermMode: sess.PermMode, Thinking: sess.Thinking, MaxTurns: sess.MaxTurns,
-		BudgetUSD: sess.BudgetUSD, UserSettings: sess.UserSettings, Fallback: sess.Fallback,
+		BudgetUSD: sess.BudgetUSD, NoUserSettings: sess.NoUserSettings, Fallback: sess.Fallback,
 		Sandbox: sess.Sandbox, Approval: sess.Approval,
 		WebSearch: sess.WebSearch, Network: sess.Network,
 		TGChat:  strconv.FormatInt(gw.cfg.ChatID, 10),
@@ -256,8 +277,6 @@ func (gw *Gateway) reply(thread int, text string, kb *Keyboard) *TGMessage {
 
 // ---------------------------------------------------------------- prompts
 
-var errBusy = fmt.Errorf("busy")
-
 // submitWithFiles sends a prompt that has files attached to it. Images are
 // named for the agent and, where the agent supports it, handed over as image
 // input rather than a path.
@@ -299,8 +318,13 @@ func (gw *Gateway) submit(sess *Session, text string) {
 }
 
 func (gw *Gateway) submitPrompt(sess *Session, text string, images []string) {
+	// Check and claim under one lock: two uploads landing together would
+	// otherwise both pass the check and start a turn each.
 	gw.mu.Lock()
 	busy := gw.running[sess.ThreadID]
+	if !busy && gw.bridge.Alive() {
+		gw.running[sess.ThreadID] = true
+	}
 	gw.mu.Unlock()
 	if busy {
 		gw.reply(sess.ThreadID, "⏳ That session is still working. Stop it, kill it, or wait.", Rows(
@@ -312,12 +336,10 @@ func (gw *Gateway) submitPrompt(sess *Session, text string, images []string) {
 		gw.reply(sess.ThreadID, "The agent bridge is restarting. Try again in a moment.", nil)
 		return
 	}
-	gw.mu.Lock()
-	gw.running[sess.ThreadID] = true
+	// The Turn belongs to its pump goroutine and is never shared: everything
+	// else asks gw.running whether a topic is busy.
 	turn := gw.NewTurn(sess)
-	gw.turns[sess.ThreadID] = turn
-	gw.mu.Unlock()
-	go gw.pump(sess, turn, text, images)
+	guard("turn", func() { gw.pump(sess, turn, text, images) })
 }
 
 // sessionPreamble is prepended to the first message of a conversation so the
@@ -338,7 +360,6 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string, images []string)
 		gw.bridge.Unsubscribe(sid, ch)
 		gw.mu.Lock()
 		delete(gw.running, sess.ThreadID)
-		delete(gw.turns, sess.ThreadID)
 		gw.mu.Unlock()
 	}()
 
@@ -428,8 +449,15 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string, images []string)
 				turn.AddNote("ℹ️ <i>" + html.EscapeString(ev.Message) + "</i>")
 				turn.Flush(false)
 			case "killed":
+				// The process is gone, so the turn is over. Waiting for a
+				// paired "done" would leave the topic busy for 45 minutes if
+				// one never came.
 				turn.AddNote("💀 <i>" + html.EscapeString(ev.Message) + "</i>")
-				turn.Flush(false)
+				gw.mu.Lock()
+				delete(gw.running, sess.ThreadID)
+				gw.mu.Unlock()
+				turn.Finish(gw.footer(sess, turn, ev))
+				return
 			case "idle":
 				// worker went quiet; nothing to show
 			case "error":
@@ -494,8 +522,11 @@ func (gw *Gateway) footer(sess *Session, turn *Turn, ev Event) string {
 // shortAgent is the name a topic title carries: the label is long enough
 // already once a project name is on the end of it.
 func shortAgent(agent string) string {
-	if agent == "codex" {
+	switch agent {
+	case "codex":
 		return "Codex"
+	case "antigravity":
+		return "Antigravity"
 	}
 	return "Claude"
 }
@@ -515,13 +546,13 @@ func topicTitle(agent, name string) string {
 func bareName(title string) string {
 	t := strings.TrimSpace(title)
 	for _, sep := range []string{" • ", " · ", " - "} {
-		for _, prefix := range []string{"Claude Code", "Claude", "Codex"} {
+		for _, prefix := range []string{"Claude Code", "Claude", "Codex", "Antigravity"} {
 			if strings.HasPrefix(t, prefix+sep) {
 				return strings.TrimSpace(t[len(prefix)+len(sep):])
 			}
 		}
 	}
-	if t == "Claude" || t == "Codex" || t == "Claude Code" {
+	if t == "Claude" || t == "Codex" || t == "Claude Code" || t == "Antigravity" {
 		return ""
 	}
 	return t
@@ -577,7 +608,8 @@ func (gw *Gateway) sessionKeyboard(sess *Session) *Keyboard {
 	return Rows(
 		[]Button{{Text: "🧠 Model", CallbackData: "model"}, {Text: "⚡ Effort", CallbackData: "effort"}},
 		[]Button{{Text: "📁 Folder", CallbackData: "cd"}, {Text: "🤖 Agent", CallbackData: "agent"}},
-		[]Button{{Text: "⚙️ Config", CallbackData: "cfg"}, {Text: "🔎 Details: " + onOff(sess.Verbose), CallbackData: "verbose"}},
+		[]Button{{Text: "🧩 Skills", CallbackData: "skills"}, {Text: "⚙️ Config", CallbackData: "cfg"}},
+		[]Button{{Text: "🔎 Details: " + onOff(sess.Verbose), CallbackData: "verbose"}, {Text: "🔓 Mode", CallbackData: "cfg:perm"}},
 		[]Button{{Text: "🧹 New thread", CallbackData: "clear"}, {Text: "💀 Kill processes", CallbackData: "kill"}},
 		[]Button{{Text: "🗑 End session", CallbackData: "end"}},
 	)
@@ -657,7 +689,14 @@ func (gw *Gateway) collectAlbum(groupID string, thread int, path, caption string
 	if a.timer != nil {
 		a.timer.Stop()
 	}
-	a.timer = time.AfterFunc(1500*time.Millisecond, func() { gw.flushAlbum(groupID) })
+	a.timer = time.AfterFunc(1500*time.Millisecond, func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logf("panic flushing an album: %v", r)
+			}
+		}()
+		gw.flushAlbum(groupID)
+	})
 	gw.mu.Unlock()
 }
 
@@ -744,7 +783,12 @@ func (gw *Gateway) rememberMenu(msgID int, p *pending) {
 func (gw *Gateway) menu(msgID int) *pending {
 	gw.mu.Lock()
 	defer gw.mu.Unlock()
-	return gw.menus[msgID]
+	p := gw.menus[msgID]
+	if p != nil && time.Now().After(p.expires) {
+		delete(gw.menus, msgID)
+		return nil
+	}
+	return p
 }
 
 func (gw *Gateway) awaitPath(userID int64, p *pending) {
@@ -799,12 +843,51 @@ func (gw *Gateway) fetchModels(agent string) ([]ModelInfo, error) {
 				gw.mu.Lock()
 				gw.modelsBy[agent] = modelCacheEntry{at: time.Now(), models: ev.Models}
 				gw.mu.Unlock()
-				return ev.Models, nil
+				return append([]ModelInfo(nil), ev.Models...), nil
 			case "error":
 				return nil, fmt.Errorf("%s", ev.Message)
 			}
 		case <-deadline:
 			return nil, fmt.Errorf("timed out waiting for the model list")
+		case <-gw.ctx.Done():
+			return nil, fmt.Errorf("shutting down")
+		}
+	}
+}
+
+// fetchSkills asks the agent what it can be told to run by name.
+func (gw *Gateway) fetchSkills(agent string) ([]SkillInfo, error) {
+	gw.mu.Lock()
+	if c, ok := gw.skillsBy[agent]; ok && time.Since(c.at) < 10*time.Minute {
+		// A copy: the caller sorts it, and the cache is shared between topics.
+		out := append([]SkillInfo(nil), c.skills...)
+		gw.mu.Unlock()
+		return out, nil
+	}
+	gw.reqSeq++
+	sid := "skills-" + agent + "-" + strconv.FormatInt(gw.reqSeq, 10)
+	gw.mu.Unlock()
+
+	ch := gw.bridge.Subscribe(sid)
+	defer gw.bridge.Unsubscribe(sid, ch)
+	if err := gw.bridge.Send(Command{Type: "skills", SID: sid, Agent: agent}); err != nil {
+		return nil, err
+	}
+	deadline := time.After(90 * time.Second)
+	for {
+		select {
+		case ev := <-ch:
+			switch ev.Type {
+			case "skills":
+				gw.mu.Lock()
+				gw.skillsBy[agent] = skillCacheEntry{at: time.Now(), skills: ev.Skills}
+				gw.mu.Unlock()
+				return append([]SkillInfo(nil), ev.Skills...), nil
+			case "error":
+				return nil, fmt.Errorf("%s", ev.Message)
+			}
+		case <-deadline:
+			return nil, fmt.Errorf("timed out waiting for the skill list")
 		case <-gw.ctx.Done():
 			return nil, fmt.Errorf("shutting down")
 		}
@@ -887,10 +970,13 @@ func (gw *Gateway) rehomeSession(sess *Session, header string) {
 }
 
 func topicColor(agent string) int {
-	if agent == "codex" {
-		return 0x8EEE98
+	switch agent {
+	case "codex":
+		return 0x8EEE98 // green
+	case "antigravity":
+		return 0xCB86DB // purple
 	}
-	return 0x6FB9F0
+	return 0x6FB9F0 // blue
 }
 
 // isThreadMissing reports whether Telegram refused because the topic is gone.
@@ -935,8 +1021,8 @@ func configSummary(sess *Session) string {
 		if sess.BudgetUSD > 0 {
 			parts = append(parts, fmt.Sprintf("budget $%.0f", sess.BudgetUSD))
 		}
-		if sess.UserSettings {
-			parts = append(parts, "~/.claude settings")
+		if sess.NoUserSettings {
+			parts = append(parts, "no ~/.claude settings")
 		}
 		if sess.Fallback != "" {
 			parts = append(parts, "flagged → "+sess.Fallback)
@@ -971,10 +1057,14 @@ func botCommands() []BotCommand {
 		{"status", "what this session is, with its buttons"},
 		{"model", "pick the model, then its effort level"},
 		{"config", "permissions, thinking, limits, sandbox"},
+		{"mode", "accept edits, plan, auto, manual…"},
+		{"skills", "run a skill, prompt or command"},
 		{"agent", "switch between Claude Code and Codex"},
 		{"effort", "how hard the model should think"},
 		{"compact", "compact the agent's context"},
 		{"clear", "forget the conversation, keep the topic"},
+		{"session", "show this topic's conversation id"},
+		{"resume", "continue another conversation here"},
 		{"stop", "interrupt the current turn"},
 		{"kill", "kill the agent and everything it started"},
 		{"cd", "change the working folder"},

@@ -5,6 +5,7 @@
 // group, without touching the other sessions. It speaks the same JSONL as
 // the bridge does, on stdin and stdout.
 import readline from 'node:readline';
+import { spawn } from 'node:child_process';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { Codex } from '@openai/codex-sdk';
 
@@ -45,7 +46,7 @@ function childEnv() {
 
 const s = {
   sid: SID, agent: 'claude', cwd: process.cwd(), model: '', effort: '', ref: '',
-  permMode: '', thinking: 0, maxTurns: 0, budget: 0, userSettings: false, fallback: '',
+  permMode: '', thinking: 0, maxTurns: 0, budget: 0, noUserSettings: false, fallback: '',
   sandbox: '', approval: '', webSearch: '', network: '',
   tgChat: '', tgTopic: '', tgToken: '', tgTitle: '',
   queue: [], running: false, abort: null,
@@ -57,7 +58,7 @@ function applyConfig(s, msg) {
   s.thinking = msg.thinking || 0;
   s.maxTurns = msg.max_turns || 0;
   s.budget = msg.budget_usd || 0;
-  s.userSettings = !!msg.user_settings;
+  s.noUserSettings = !!msg.no_user_settings;
   s.fallback = msg.fallback_model || '';
   if (msg.tg_chat !== undefined) s.tgChat = msg.tg_chat || '';
   if (msg.tg_topic !== undefined) s.tgTopic = msg.tg_topic || '';
@@ -67,6 +68,14 @@ function applyConfig(s, msg) {
   s.approval = msg.approval || '';
   s.webSearch = msg.web_search || '';
   s.network = msg.network || '';
+}
+
+function normaliseAgent(name) {
+  switch (name) {
+    case 'codex': return 'codex';
+    case 'antigravity': case 'agy': return 'antigravity';
+    default: return 'claude';
+  }
 }
 
 function clip(str, n = 400) {
@@ -85,10 +94,12 @@ async function runClaude(s, text, images) {
     cwd: s.cwd,
     permissionMode: mode,
     allowDangerouslySkipPermissions: mode === 'bypassPermissions',
-    // By default the user settings file is dropped: it carries this machine's
-    // own permission rules, and the gateway decides its own policy. The
-    // Config button can put it back.
-    settingSources: s.userSettings ? ['user', 'project', 'local'] : [],
+    // Load the machine's own settings by default: that is where the user's
+    // skills, plugins and CLAUDE.md live, and this gateway is meant to feel
+    // like their own Claude Code. Config can turn it off per session.
+    settingSources: s.noUserSettings ? [] : ['user', 'project', 'local'],
+    // Every skill the CLI can find, including ones plugins bring.
+    skills: 'all',
     includePartialMessages: true,
     abortController: ac,
     env: childEnv(),
@@ -207,9 +218,179 @@ function describeClaudeTool(name, input) {
   }
 }
 
+// ---------------------------------------------------------------- antigravity
+//
+// Antigravity ships a CLI rather than an SDK, but it speaks the same shape:
+// one NDJSON event per line, a conversation id to resume by, and permission
+// flags. So it is driven directly.
+
+function runAntigravity(s, text, images) {
+  return new Promise((resolve, reject) => {
+    const args = ['--output-format', 'stream-json'];
+    switch (s.permMode) {
+      case 'plan':
+        args.push('--mode', 'plan');
+        break;
+      case 'acceptEdits':
+        args.push('--mode', 'accept-edits');
+        break;
+      default:
+        args.push('--dangerously-skip-permissions');
+    }
+    if (s.model) args.push('--model', s.model);
+    if (s.effort) args.push('--effort', s.effort);
+    if (s.ref) args.push('--conversation', s.ref);
+    let prompt = text;
+    if (images && images.length) {
+      prompt += '\n\nAttached image' + (images.length > 1 ? 's' : '') + ':\n' + images.join('\n') +
+        '\nOpen ' + (images.length > 1 ? 'them' : 'it') + ' before answering.';
+    }
+    args.push('--print=' + prompt);
+
+    const child = spawn('agy', args, {
+      cwd: s.cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true, // its own group, so an interrupt reaches what it spawned
+    });
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    let hardKill = null;
+    s.abort = () => {
+      try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch { /* gone */ } }
+      // If it ignores the polite signal, end it, or the turn never settles.
+      hardKill = setTimeout(() => {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+      }, 5000);
+    };
+
+    let buf = '';
+    let stderr = '';
+    const t0 = Date.now();
+    const tools = new Map(); // step_index -> tool name, so a start is only announced once
+
+    child.stdout.on('data', chunk => {
+      buf += chunk;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (!line.startsWith('{')) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        handleAgyEvent(s, ev, tools, t0);
+      }
+    });
+    child.stderr.on('data', d => { stderr += d; if (stderr.length > 4000) stderr = stderr.slice(-4000); });
+
+    child.on('error', err => reject(err));
+    child.on('exit', (code, signal) => {
+      s.abort = null;
+      if (hardKill) clearTimeout(hardKill);
+      const finished = s.agyFinished;
+      s.agyFinished = false;
+      if (signal) {
+        reject(new Error('aborted'));
+        return;
+      }
+      if (code !== 0 && !finished) {
+        out({ type: 'error', sid: s.sid, message: clip(stderr || `agy exited with ${code}`, 800) });
+        out({ type: 'done', sid: s.sid, session: s.ref, cost: 0, duration_ms: Date.now() - t0, subtype: 'error' });
+      }
+      resolve();
+    });
+  });
+}
+
+function handleAgyEvent(s, ev, tools, t0) {
+  switch (ev.event) {
+    case 'init':
+      if (ev.conversation_id) {
+        s.ref = ev.conversation_id;
+        out({ type: 'started', sid: s.sid, agent: 'antigravity', session: s.ref, model: s.model });
+      }
+      break;
+    case 'step_update': {
+      const su = ev.step_update || {};
+      if (su.conversation_id && !s.ref) s.ref = su.conversation_id;
+      if (su.step_type === 'agent_response' && su.text_delta) {
+        out({ type: 'delta', sid: s.sid, text: su.text_delta });
+        break;
+      }
+      if (su.step_type === 'tool') {
+        const info = su.tool_info || {};
+        const name = su.tool_name || info.name || 'tool';
+        if (su.state === 'ACTIVE' && !tools.has(su.step_index)) {
+          tools.set(su.step_index, name);
+          out({ type: 'tool', sid: s.sid, status: 'start', name: agyToolName(name), detail: agyToolDetail(name, info) });
+        } else if (su.state === 'DONE') {
+          const failed = /error|fail/i.test(String(info.status || ''));
+          out({
+            type: 'tool', sid: s.sid, status: failed ? 'fail' : 'ok',
+            name: agyToolName(name), detail: clip(String(info.output || ''), 700),
+          });
+        }
+      }
+      break;
+    }
+    case 'result': {
+      const r = ev.result || {};
+      s.agyFinished = true;
+      if (r.conversation_id) s.ref = r.conversation_id;
+      if (r.status && r.status !== 'SUCCESS') {
+        out({ type: 'error', sid: s.sid, message: clip(r.error || r.status, 800) });
+      }
+      out({
+        type: 'done', sid: s.sid, session: s.ref,
+        cost: 0,
+        duration_ms: Math.round((r.duration_seconds || (Date.now() - t0) / 1000) * 1000),
+        turns: r.num_turns || 0,
+        tokens: r.usage ? { input: r.usage.input_tokens || 0, output: r.usage.output_tokens || 0 } : null,
+        subtype: r.status === 'SUCCESS' ? 'success' : 'error',
+      });
+      break;
+    }
+  }
+}
+
+// Antigravity's tool names map onto the same handful of ideas the other
+// agents use, so the step lines read the same way.
+function agyToolName(name) {
+  switch (name) {
+    case 'run_command': return 'Bash';
+    case 'view_file': case 'read_file': return 'Read';
+    case 'write_to_file': case 'create_file': return 'Write';
+    case 'replace_file_content': case 'edit_file': return 'Edit';
+    case 'grep_search': case 'codebase_search': return 'Grep';
+    case 'find_by_name': case 'list_dir': return 'Glob';
+    case 'read_url_content': case 'read_web_page': return 'WebFetch';
+    case 'search_web': return 'WebSearch';
+    default:
+      if (name.startsWith('browser_')) return 'Browser';
+      return name;
+  }
+}
+
+function agyToolDetail(name, info) {
+  const p = info.parameters || {};
+  if (name === 'run_command') return clip(p.CommandLine || p.command || '', 300);
+  for (const key of ['AbsolutePath', 'TargetFile', 'File', 'path', 'Query', 'SearchTerm', 'Url', 'query']) {
+    if (p[key]) return clip(String(p[key]), 300);
+  }
+  return clip(JSON.stringify(p), 200);
+}
+
 // ---------------------------------------------------------------- codex
 
-async function runCodex(s, text, images) {
+// Codex sometimes ends a thread with "Chat stopped as a precaution", and that
+// thread can never be resumed again - resuming it just fails the same way. The
+// way through is the one a person would take: start a fresh thread and tell it
+// to pick up the abandoned one's work.
+const SAFETY_STOP = /stopped as a precaution|acting safely|start or resume another chat|resume another chat/i;
+
+function isSafetyStop(text) {
+  return SAFETY_STOP.test(String(text || ''));
+}
+
+async function runCodex(s, text, images, recovered = false) {
   const ac = new AbortController();
   s.abort = () => ac.abort();
   const threadOpts = {
@@ -292,12 +473,23 @@ async function runCodex(s, text, images) {
         usage = ev.usage || null;
         break;
       case 'turn.failed':
+        if (!recovered && isSafetyStop(ev.error?.message)) {
+          safetyStopped = true;
+          break;
+        }
         out({ type: 'error', sid: s.sid, message: clip(ev.error?.message || 'turn failed', 800) });
         break;
       case 'error':
+        if (!recovered && isSafetyStop(ev.message)) {
+          safetyStopped = true;
+          break;
+        }
         out({ type: 'error', sid: s.sid, message: clip(ev.message || 'error', 800) });
         break;
     }
+  }
+  if (safetyStopped) {
+    return recoverCodexThread(s, text, images, abandoned);
   }
   out({
     type: 'done', sid: s.sid, session: s.ref,
@@ -306,6 +498,26 @@ async function runCodex(s, text, images) {
     tokens: usage ? { input: (usage.input_tokens || 0), output: (usage.output_tokens || 0) } : null,
     subtype: 'success',
   });
+}
+
+// recoverCodexThread starts a clean thread and asks it to take over the work
+// of the one Codex refuses to continue.
+async function recoverCodexThread(s, text, images, abandoned) {
+  s.ref = '';
+  out({
+    type: 'note', sid: s.sid,
+    message: abandoned
+      ? 'Codex stopped that thread as a precaution. Carrying the work into a fresh one.'
+      : 'Codex stopped as a precaution. Trying again in a fresh thread.',
+  });
+  let prompt = text;
+  if (abandoned) {
+    prompt =
+      'Your previous session (' + abandoned + ') was stopped by a safety check and cannot be resumed. ' +
+      'Find its transcript under ~/.codex/sessions (search for that id), read what was already done, ' +
+      'and carry that work on in this session.\n\n' + text;
+  }
+  return runCodex(s, prompt, images, true);
 }
 
 // ---------------------------------------------------------------- queue
@@ -317,6 +529,7 @@ async function pump() {
     const { text, images } = s.queue.shift();
     try {
       if (s.agent === 'codex') await runCodex(s, text, images);
+      else if (s.agent === 'antigravity') await runAntigravity(s, text, images);
       else await runClaude(s, text, images);
     } catch (err) {
       const msg = String(err?.message || err);
@@ -340,7 +553,7 @@ rl.on('line', line => {
   try {
     switch (msg.type) {
       case 'start':
-        s.agent = msg.agent === 'codex' ? 'codex' : 'claude';
+        s.agent = normaliseAgent(msg.agent);
         if (msg.cwd) s.cwd = msg.cwd;
         s.model = msg.model || '';
         s.effort = msg.effort || '';
@@ -350,7 +563,7 @@ rl.on('line', line => {
         break;
       case 'prompt':
         if (msg.cwd) s.cwd = msg.cwd;
-        if (msg.agent) s.agent = msg.agent === 'codex' ? 'codex' : 'claude';
+        if (msg.agent) s.agent = normaliseAgent(msg.agent);
         if (msg.model !== undefined) s.model = msg.model || '';
         if (msg.effort !== undefined) s.effort = msg.effort || '';
         if (msg.resume !== undefined) s.ref = msg.resume || '';

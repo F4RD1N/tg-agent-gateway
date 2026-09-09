@@ -16,7 +16,7 @@ func TestLiveAgents(t *testing.T) {
 	if os.Getenv("AGENT_LIVE") == "" {
 		t.Skip("set AGENT_LIVE=1 to run turns against the real agents")
 	}
-	for _, agent := range []string{"claude", "codex"} {
+	for _, agent := range []string{"claude", "codex", "antigravity"} {
 		t.Run(agent, func(t *testing.T) {
 			gw, f, work := newTestGateway(t)
 			// Swap the fake bridge for the real one.
@@ -32,8 +32,11 @@ func TestLiveAgents(t *testing.T) {
 			gw.store.Put(&Session{ThreadID: thread, Agent: agent, Cwd: work, Created: time.Now(), LastUsed: time.Now()})
 
 			gw.handleUpdate(msg(thread, "Run the shell command `echo LIVE-"+strings.ToUpper(agent)+"-OK`, then reply with exactly the word FINISHED."))
-			f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "FINISHED", 5*time.Minute)
-			f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "Bash", 30*time.Second)
+			c := f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "FINISHED", 5*time.Minute)
+			// The narration is what shows; the command behind it must not.
+			if txt, _ := c.Params["text"].(string); strings.Contains(txt, "echo LIVE-") {
+				t.Errorf("the command line leaked into the message: %q", truncate(txt, 200))
+			}
 
 			var sess *Session
 			deadline = time.Now().Add(60 * time.Second)
