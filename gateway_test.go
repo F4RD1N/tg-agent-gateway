@@ -316,14 +316,19 @@ func TestPromptStreamsAndFinishes(t *testing.T) {
 	if !has(buttons(sent), "stop") {
 		t.Errorf("a running turn must offer a Stop button, got %v", buttons(sent))
 	}
-	// The step shows as a human phrase, and the turn is sealed with a footer.
-	f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "Running", 10*time.Second)
+	// The turn is sealed with a footer, and the paragraph is ticked off.
 	f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "1.2s", 10*time.Second)
 	f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "1 step", 10*time.Second)
-	// The finished message must not carry the raw command or the tool name.
 	last := f.findAny([]string{"editMessageText"}, "1.2s")
-	if txt, _ := last.Params["text"].(string); strings.Contains(txt, "echo hi") || strings.Contains(txt, "<b>Bash</b>") {
-		t.Errorf("the finished message still shows the command line: %q", truncate(txt, 200))
+	txt, _ := last.Params["text"].(string)
+	if !strings.Contains(txt, markDone+" Hello world") {
+		t.Errorf("the finished paragraph should be ticked: %q", truncate(txt, 200))
+	}
+	// The finished message must not carry the command, its output or the tool.
+	for _, leak := range []string{"echo hi", "Bash", "Running"} {
+		if strings.Contains(txt, leak) {
+			t.Errorf("the message leaks %q: %s", leak, truncate(txt, 200))
+		}
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -1060,58 +1065,65 @@ func TestCleanCommand(t *testing.T) {
 	}
 }
 
-// Finished steps stay on screen with a tick; only the last one is live.
-func TestStepChecklist(t *testing.T) {
+// The checklist is the agent's own narration: what it said it would do,
+// ticked off as it moves on, with the newest paragraph marked as current.
+func TestNarrationChecklist(t *testing.T) {
 	gw, _, work := newTestGateway(t)
-	sess := &Session{ThreadID: 71, Agent: "claude", Cwd: work}
+	sess := &Session{ThreadID: 71, Agent: "codex", Cwd: work}
 	turn := gw.NewTurn(sess)
+
+	turn.AddText("I'll set the project up and wire the pieces together.")
+	turn.SetStep("start", "Bash", `/bin/bash -lc "mkdir -p site"`)
+	turn.SetStep("ok", "Bash", "")
+	turn.AddText("The layout is in place. Adding the parts it depends on.")
 	turn.SetStep("start", "Bash", `/bin/bash -lc "npm install"`)
 	turn.SetStep("ok", "Bash", "added 120 packages")
-	turn.SetStep("start", "Bash", `/bin/bash -lc "npm test"`)
+	turn.AddText("Everything is built. I'm checking it works now.")
+
 	body := turn.render()
-	if !strings.Contains(body, markDone+" Installing dependencies") {
-		t.Errorf("a finished step should keep its place with a tick: %q", body)
+	if strings.Count(body, markDone) != 2 {
+		t.Errorf("finished paragraphs should be ticked: %q", body)
 	}
-	if !strings.Contains(body, markRunning+" Running tests") {
-		t.Errorf("the live step should be marked as running: %q", body)
+	if strings.Count(body, markRunning) != 1 || !strings.Contains(body, markRunning+" Everything is built") {
+		t.Errorf("the newest paragraph should be the current one: %q", body)
 	}
-	// A failure is marked, and does not stop later steps.
-	turn.SetStep("fail", "Bash", "exit status 1")
-	turn.SetStep("start", "Bash", `/bin/bash -lc "go build ./..."`)
-	body = turn.render()
-	if !strings.Contains(body, markFailed+" Running tests") {
-		t.Errorf("a failed step should be marked: %q", body)
+	// No command, no tool name, no log.
+	for _, leak := range []string{"npm install", "mkdir", "Bash", "added 120"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("the message leaks %q: %s", leak, body)
+		}
 	}
-	if strings.Count(body, markDone) != 1 || strings.Count(body, markRunning) != 1 {
-		t.Errorf("expected one done and one running mark: %q", body)
-	}
-	// Finishing closes whatever is still open.
+	// Finishing marks everything done.
 	turn.Finish("")
 	if strings.Contains(turn.render(), markRunning) {
-		t.Errorf("a finished turn leaves nothing running: %q", turn.render())
+		t.Errorf("a finished turn has nothing in progress: %q", turn.render())
 	}
-	// The agent's own words sit above the steps that follow them.
-	turn2 := gw.NewTurn(sess)
-	turn2.AddText("I will set the project up.")
-	turn2.SetStep("start", "Bash", `/bin/bash -lc "mkdir -p app"`)
-	if got := turn2.render(); !strings.HasPrefix(got, "I will set the project up.") {
-		t.Errorf("text should come before the steps it introduces: %q", got)
+	if strings.Count(turn.render(), markDone) != 3 {
+		t.Errorf("every paragraph should be ticked at the end: %q", turn.render())
 	}
 }
 
-// A very long turn keeps the checklist bounded.
-func TestChecklistIsBounded(t *testing.T) {
+// A plain answer is a plain answer: no checklist for a question that needed
+// no work.
+func TestSingleAnswerHasNoMarks(t *testing.T) {
 	gw, _, work := newTestGateway(t)
-	turn := gw.NewTurn(&Session{ThreadID: 72, Agent: "claude", Cwd: work})
-	for i := 0; i < maxVisibleSteps+8; i++ {
-		turn.SetStep("start", "Bash", `/bin/bash -lc "go test ./..."`)
-		turn.SetStep("ok", "Bash", "ok")
-	}
+	turn := gw.NewTurn(&Session{ThreadID: 73, Agent: "claude", Cwd: work})
+	turn.AddText("It is at /etc/nginx/nginx.conf.")
 	body := turn.render()
-	if n := strings.Count(body, markDone); n > maxVisibleSteps {
-		t.Errorf("checklist shows %d steps, more than the %d cap", n, maxVisibleSteps)
+	if strings.Contains(body, markDone) || strings.Contains(body, markRunning) {
+		t.Fatalf("a one-paragraph answer needs no marks: %q", body)
 	}
-	if !strings.Contains(body, "earlier steps") {
-		t.Errorf("the trimmed steps should be counted: %q", truncate(body, 200))
+}
+
+// Details on: the tool list is available, folded away.
+func TestDetailsShowTheToolList(t *testing.T) {
+	gw, _, work := newTestGateway(t)
+	turn := gw.NewTurn(&Session{ThreadID: 74, Agent: "claude", Cwd: work, Verbose: true})
+	turn.AddText("Setting things up.")
+	turn.SetStep("start", "Bash", `/bin/bash -lc "npm install"`)
+	turn.SetStep("ok", "Bash", "")
+	body := turn.render()
+	if !strings.Contains(body, "blockquote expandable") || !strings.Contains(body, "Installing dependencies") {
+		t.Fatalf("Details should list the steps behind a fold: %q", body)
 	}
 }

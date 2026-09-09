@@ -36,19 +36,20 @@ does kill everything that session started.
   and whether `~/.claude/settings.json` is loaded; for Codex the sandbox,
   approval policy, web search and network access.
 - **Live answers, the way app builders show them.** The reply is one message
-  edited as it streams: the agent's words, and a checklist of what it did.
+  edited as it streams, and what it shows is the agent's own narration: one
+  paragraph per thing it set out to do, ticked off as it moves on.
 
   ```
-  ✔️ Installing dependencies
-  ✔️ Running tests
-  ▫️ Editing js/app.js
+  ✅️ I'll set the project up and wire the pieces together.
+  ✅️ The layout is in place. Adding the parts it depends on.
+  ✳️ Everything is built. I'm checking that it works.
   ```
 
-  Finished steps keep their tick, only the last one is live, and the command
-  and its output are not shown at all unless Details are on, because a wall of
-  log hides the answer on a phone. **Stop** ends the turn but leaves it
-  resumable; **Kill** takes down the agent process and every command it
-  started.
+  The commands behind those sentences are not shown, and neither is their
+  output: the agent already said what it is doing, in better words than a
+  command line. Switch Details on for the list of steps, folded away.
+  **Stop** ends the turn but leaves it resumable; **Kill** takes down the
+  agent process and every command it started.
 - **Many topics at once.** Sessions run in parallel; the edit pacing widens
   automatically as more of them stream, so they do not trip Telegram's
   group-wide flood limit.

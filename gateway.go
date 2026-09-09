@@ -364,15 +364,8 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string) {
 				turn.SetFileStep(ev.Kind, ev.Path)
 				turn.Flush(false)
 			case "todo":
-				// The agent's own plan already reads as a checklist; only the
-				// item it just started is worth a line of its own.
-				for _, it := range ev.Items {
-					if !it.Done {
-						turn.SetStep("start", "todo-item", truncate(it.Text, 90))
-						break
-					}
-				}
-				turn.Flush(false)
+				// The agent narrates its own plan in words; the structured
+				// checklist would only repeat it.
 			case "busy":
 				turn.AddNote("<i>queued behind the running turn</i>")
 			case "stopped":
