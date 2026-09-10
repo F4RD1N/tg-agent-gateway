@@ -188,6 +188,14 @@ func buttons(c *sentCall) []string {
 	return out
 }
 
+// keyboardAsMap round-trips a keyboard the way the fake API sees it.
+func keyboardAsMap(kb *Keyboard) map[string]any {
+	data, _ := json.Marshal(kb)
+	var out map[string]any
+	_ = json.Unmarshal(data, &out)
+	return out
+}
+
 func has(list []string, want string) bool {
 	for _, s := range list {
 		if s == want {
@@ -658,6 +666,44 @@ func TestModeCommandShowsButtons(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("mode was not applied: %+v", gw.store.Get(57))
+}
+
+// Only the agents this machine has are offered, and a lone agent is not
+// something to ask about.
+func TestOnlyInstalledAgentsAreOffered(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	// Pretend only Claude is installed.
+	gw.mu.Lock()
+	gw.agentsOK = map[string]bool{"claude": true, "codex": false, "antigravity": false}
+	gw.agentsAt = time.Now()
+	gw.mu.Unlock()
+
+	if got := gw.availableAgents(); len(got) != 1 || got[0] != "claude" {
+		t.Fatalf("availableAgents = %v", got)
+	}
+	b := buttons(&sentCall{Params: map[string]any{"reply_markup": keyboardAsMap(gw.agentPicker("new:agent:"))}})
+	if has(b, "new:agent:codex") || has(b, "new:agent:antigravity") {
+		t.Errorf("a missing agent must not be offered: %v", b)
+	}
+
+	// With one agent there is nothing to choose, so /new goes straight on.
+	gw.handleUpdate(msg(0, "/new"))
+	f.waitFor(t, "sendMessage", "Folder", 5*time.Second)
+
+	// Naming a missing agent is refused with an explanation.
+	gw.handleUpdate(msg(0, "/new codex "+work))
+	f.waitFor(t, "sendMessage", "not installed", 5*time.Second)
+}
+
+// With nothing installed the bot says so instead of failing later.
+func TestNoAgentsInstalled(t *testing.T) {
+	gw, f, _ := newTestGateway(t)
+	gw.mu.Lock()
+	gw.agentsOK = map[string]bool{"claude": false, "codex": false, "antigravity": false}
+	gw.agentsAt = time.Now()
+	gw.mu.Unlock()
+	gw.handleUpdate(msg(0, "/new"))
+	f.waitFor(t, "sendMessage", "No agent is installed", 5*time.Second)
 }
 
 // Antigravity is a first-class agent: it can be chosen, named and configured.

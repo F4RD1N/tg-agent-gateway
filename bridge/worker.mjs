@@ -281,7 +281,13 @@ function runAntigravity(s, text, images) {
     });
     child.stderr.on('data', d => { stderr += d; if (stderr.length > 4000) stderr = stderr.slice(-4000); });
 
-    child.on('error', err => reject(err));
+    child.on('error', err => {
+      if (err && err.code === 'ENOENT') {
+        reject(new Error('Antigravity is not installed on this server (the agy command was not found)'));
+        return;
+      }
+      reject(err);
+    });
     child.on('exit', (code, signal) => {
       s.abort = null;
       if (hardKill) clearTimeout(hardKill);

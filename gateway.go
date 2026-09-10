@@ -67,6 +67,8 @@ type Gateway struct {
 	running  map[int]bool
 	menus    map[int]*pending
 	awaitTP  map[int64]*pending // user id -> "send me a path" state
+	agentsAt time.Time
+	agentsOK map[string]bool
 	modelsBy map[string]modelCacheEntry
 	skillsBy map[string]skillCacheEntry
 	albums   map[string]*album
@@ -98,6 +100,7 @@ func NewGateway(ctx context.Context, cfg *Config, store *Store) *Gateway {
 		bridge: NewBridge(cfg.BridgeCmd), ctx: ctx,
 		running: map[int]bool{},
 		menus:   map[int]*pending{}, awaitTP: map[int64]*pending{},
+		agentsOK: map[string]bool{},
 		modelsBy: map[string]modelCacheEntry{},
 		skillsBy: map[string]skillCacheEntry{},
 		albums:   map[string]*album{},
@@ -162,6 +165,12 @@ func (gw *Gateway) Run() error {
 	logf("gateway ready as @%s in %q (%d)", me.Username, chat.Title, chat.ID)
 	if err := gw.tg.SetCommands(gw.ctx, gw.cfg.ChatID, botCommands()); err != nil {
 		logf("could not publish the command menu: %v", err)
+	}
+	switch available := gw.availableAgents(); len(available) {
+	case 0:
+		logf("WARNING: none of claude, codex or agy is on PATH; install one, or sessions cannot start")
+	default:
+		logf("agents available: %s", strings.Join(available, ", "))
 	}
 	gw.reconcileTopics()
 
@@ -614,6 +623,9 @@ func (gw *Gateway) sessionHeader(sess *Session) string {
 	if sess.Effort != "" {
 		s += " · ⚡" + html.EscapeString(sess.Effort)
 	}
+	if !gw.agentInstalled(sess.Agent) {
+		s += "\n⚠️ <i>" + agentLabel(sess.Agent) + " is not installed on this server</i>"
+	}
 	if extra := configSummary(sess); extra != "" {
 		s += "\n⚙️ " + extra
 	}
@@ -947,6 +959,82 @@ func (gw *Gateway) takeAwaited(userID int64) *pending {
 		return nil
 	}
 	return p
+}
+
+// ---------------------------------------------------------------- agents
+//
+// Only the agents actually installed on this machine are offered. Someone who
+// has Claude Code but not Codex should never be shown a Codex button that
+// fails on its first message.
+
+// allAgents is the order they are offered in.
+var allAgents = []string{"claude", "codex", "antigravity"}
+
+func agentBinary(agent string) string {
+	switch agent {
+	case "codex":
+		return "codex"
+	case "antigravity":
+		return "agy"
+	}
+	return "claude"
+}
+
+// agentInstalled reports whether an agent's CLI can be found, remembering the
+// answer for a minute so a picker does not shell out on every tap.
+func (gw *Gateway) agentInstalled(agent string) bool {
+	gw.mu.Lock()
+	fresh := time.Since(gw.agentsAt) < time.Minute
+	ok, seen := gw.agentsOK[agent]
+	gw.mu.Unlock()
+	if fresh && seen {
+		return ok
+	}
+	found := map[string]bool{}
+	for _, a := range allAgents {
+		found[a] = lookAgent(agentBinary(a))
+	}
+	gw.mu.Lock()
+	gw.agentsOK = found
+	gw.agentsAt = time.Now()
+	gw.mu.Unlock()
+	return found[agent]
+}
+
+// lookAgent checks PATH, then asks a login shell, because these CLIs install
+// into ~/.local/bin, which a service PATH does not always carry.
+func lookAgent(bin string) bool {
+	if _, err := exec.LookPath(bin); err == nil {
+		return true
+	}
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, shell, "-lc", "command -v "+bin)
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
+}
+
+// availableAgents lists what can actually be run here.
+func (gw *Gateway) availableAgents() []string {
+	var out []string
+	for _, a := range allAgents {
+		if gw.agentInstalled(a) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// defaultAgent is what to use when there is nothing to choose between.
+func (gw *Gateway) defaultAgent() string {
+	if list := gw.availableAgents(); len(list) > 0 {
+		return list[0]
+	}
+	return "claude"
 }
 
 // ---------------------------------------------------------------- models

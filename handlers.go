@@ -536,8 +536,21 @@ func resolvePath(base, p string) string {
 // name of the topic.
 func (gw *Gateway) cmdNew(thread int, arg string) {
 	agent, path, name := parseNewArgs(arg)
+	available := gw.availableAgents()
+	if len(available) == 0 {
+		gw.reply(thread, noAgentsText(), nil)
+		return
+	}
+	if agent != "" && !gw.agentInstalled(agent) {
+		gw.reply(thread, "⚠️ "+agentLabel(agent)+" is not installed on this server.", gw.agentPicker("new:agent:"))
+		return
+	}
+	if agent == "" && len(available) == 1 {
+		// Nothing to choose between, so do not ask.
+		agent = available[0]
+	}
 	if agent == "" {
-		m := gw.reply(thread, "Which agent?", agentPicker("new:agent:"))
+		m := gw.reply(thread, "Which agent?", gw.agentPicker("new:agent:"))
 		if m != nil {
 			gw.rememberMenu(m.MessageID, &pending{kind: "newagent", name: name, threadID: thread})
 		}
@@ -914,30 +927,38 @@ func (gw *Gateway) presentEfforts(thread, editMsg int, sess *Session, models []M
 	gw.rememberMenu(sent.MessageID, &pending{kind: "effort", agent: sess.Agent, models: models, modelIdx: idx, threadID: thread})
 }
 
-// agentPicker is the one list of agents, so adding one shows up everywhere.
-func agentPicker(prefix string, current ...string) *Keyboard {
+var agentButtonLabel = map[string]string{
+	"claude":      "🟠 Claude Code",
+	"codex":       "🟢 Codex",
+	"antigravity": "🟣 Antigravity",
+}
+
+// agentPicker offers the agents this machine actually has.
+func (gw *Gateway) agentPicker(prefix string, current ...string) *Keyboard {
 	cur := ""
 	if len(current) > 0 {
 		cur = current[0]
 	}
 	var buttons []Button
-	for _, a := range []struct{ id, label string }{
-		{"claude", "🟠 Claude Code"},
-		{"codex", "🟢 Codex"},
-		{"antigravity", "🟣 Antigravity"},
-	} {
-		label := a.label
-		if a.id == cur {
+	for _, a := range gw.availableAgents() {
+		label := agentButtonLabel[a]
+		if a == cur {
 			label = "✓ " + label
 		}
-		buttons = append(buttons, Button{Text: label, CallbackData: prefix + a.id})
+		buttons = append(buttons, Button{Text: label, CallbackData: prefix + a})
 	}
 	return Grid(2, buttons)
 }
 
+// noAgentsText explains the one situation the bot cannot work around.
+func noAgentsText() string {
+	return "No agent is installed on this server.\n\nInstall one and it appears here:\n" +
+		"· Claude Code — <code>claude</code>\n· Codex — <code>codex</code>\n· Antigravity — <code>agy</code>"
+}
+
 func (gw *Gateway) showAgents(thread int, sess *Session, editMsg int) {
 	gw.notify(thread, editMsg, "Which agent runs in this topic?\nSwitching starts a fresh conversation.",
-		agentPicker("agt:", sess.Agent))
+		gw.agentPicker("agt:", sess.Agent))
 }
 
 func (gw *Gateway) cmdSessions(thread int) {
@@ -1110,7 +1131,7 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 	case "new":
 		if arg == "" {
 			ack("")
-			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, "Which agent?", agentPicker("new:agent:"))
+			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, "Which agent?", gw.agentPicker("new:agent:"))
 			return
 		}
 		if strings.HasPrefix(arg, "agent:") {
@@ -1210,6 +1231,10 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 		gw.startSession(p.threadID, p.agent, p.dirs[0], "", msgID)
 
 	case "bind":
+		if !gw.agentInstalled(arg) {
+			ack(agentLabel(arg) + " is not installed")
+			return
+		}
 		ack("")
 		gw.startSession(thread, arg, gw.cfg.DefaultCwd, "", msgID)
 
@@ -1354,6 +1379,10 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 		}
 		if arg != "claude" && arg != "codex" && arg != "antigravity" {
 			ack("")
+			return
+		}
+		if !gw.agentInstalled(arg) {
+			ack(agentLabel(arg) + " is not installed")
 			return
 		}
 		if gw.busyHere(thread) {

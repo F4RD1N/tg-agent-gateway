@@ -91,6 +91,13 @@ administrator with *Manage Topics*. In BotFather, set `/setprivacy` to
 
 ```bash
 unzip tg-agent-gateway_source_*.zip -d tg-agent-gateway && cd tg-agent-gateway
+sudo ./installer.sh
+```
+
+It will ask for the token, the group, who may use it and which folders it may
+work in. To skip the questions, pass them instead:
+
+```bash
 sudo ./installer.sh --token <bot token> --chat -1001234567890 --users <your user id>
 ```
 
