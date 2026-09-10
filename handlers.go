@@ -1483,15 +1483,15 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 		_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, "🗑 <i>session ended, topic closed</i>", nil)
 		_ = gw.tg.CloseTopic(gw.ctx, gw.cfg.ChatID, thread)
 
-	case "look":
-		p := gw.menu(msgID)
-		if p == nil || sess == nil || len(p.dirs) == 0 {
-			ack("That message is too old; send the file again.")
+	case "unhold":
+		held, _ := gw.takeHeldFiles(thread)
+		ack("Forgotten")
+		if len(held) == 0 {
+			_ = gw.tg.EditKeyboard(gw.ctx, gw.cfg.ChatID, msgID, nil)
 			return
 		}
-		ack("")
-		_ = gw.tg.EditKeyboard(gw.ctx, gw.cfg.ChatID, msgID, nil)
-		gw.submitWithFiles(sess, "Look at this and tell me what you see.", p.dirs)
+		_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID,
+			fmt.Sprintf("📎 %d file(s) are still saved in the folder; I will not bring them up again.", len(held)), nil)
 
 	default:
 		ack("")

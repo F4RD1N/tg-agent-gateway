@@ -1034,6 +1034,62 @@ func TestPhotoWithCaptionReachesTheAgent(t *testing.T) {
 	t.Fatal("the caption never reached the agent")
 }
 
+// A file with no caption waits: the agent is only asked once the next message
+// says what to do with it.
+func TestFileWithoutCaptionWaitsForAPrompt(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.store.Put(&Session{ThreadID: 16, Agent: "claude", Cwd: work, Created: time.Now(), LastUsed: time.Now()})
+
+	u := msg(16, "")
+	u.Message.Document = &TGFile{FileID: "d1", FileName: "report.pdf"}
+	gw.handleUpdate(u)
+	c := f.waitFor(t, "sendMessage", "What should I do with it?", 5*time.Second)
+	if !has(buttons(c), "unhold") {
+		t.Errorf("the ask should offer a way out, got %v", buttons(c))
+	}
+	// Nothing has run yet.
+	time.Sleep(600 * time.Millisecond)
+	if s := gw.store.Get(16); s == nil || s.Turns != 0 {
+		t.Fatalf("an uncaptioned file must not start a turn: %+v", gw.store.Get(16))
+	}
+	// The next message is the instruction, and it carries the file.
+	gw.handleUpdate(msg(16, "summarise this"))
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := gw.store.Get(16); s != nil && s.Turns == 1 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("the instruction never reached the agent")
+}
+
+// Every attachment type Telegram sends is accepted, not only photos.
+func TestAllAttachmentKinds(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.store.Put(&Session{ThreadID: 17, Agent: "claude", Cwd: work, Created: time.Now(), LastUsed: time.Now()})
+	cases := []struct {
+		name  string
+		apply func(*TGMessage)
+		want  string
+	}{
+		{"video", func(m *TGMessage) { m.Video = &TGFile{FileID: "v", MimeType: "video/mp4"} }, "video_"},
+		{"audio", func(m *TGMessage) { m.Audio = &TGFile{FileID: "a", FileName: "song.mp3"} }, "song.mp3"},
+		{"voice", func(m *TGMessage) { m.Voice = &TGFile{FileID: "o", MimeType: "audio/ogg"} }, "voice_message_"},
+		{"animation", func(m *TGMessage) { m.Animation = &TGFile{FileID: "g", MimeType: "video/mp4"} }, "animation_"},
+		{"sticker", func(m *TGMessage) { m.Sticker = &TGFile{FileID: "s", MimeType: "image/webp"} }, "sticker_"},
+		{"video note", func(m *TGMessage) { m.VideoNote = &TGFile{FileID: "n"} }, "video_note_"},
+	}
+	for i, c := range cases {
+		u := msg(17, "")
+		u.Message.MessageID = 200 + i
+		u.Message.Caption = "describe it"
+		c.apply(u.Message)
+		gw.handleUpdate(u)
+		f.waitFor(t, "sendMessage", c.want, 5*time.Second)
+	}
+}
+
 // Several photos sent as one album become one message to the agent.
 func TestPhotoAlbumIsSentOnce(t *testing.T) {
 	gw, f, work := newTestGateway(t)

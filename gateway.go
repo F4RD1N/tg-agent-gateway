@@ -70,7 +70,16 @@ type Gateway struct {
 	modelsBy map[string]modelCacheEntry
 	skillsBy map[string]skillCacheEntry
 	albums   map[string]*album
+	waiting  map[int]*fileWait
 	reqSeq   int64
+}
+
+// fileWait holds files that arrived without a caption. Nothing is sent to the
+// agent until the next message says what to do with them.
+type fileWait struct {
+	paths   []string
+	askedAt int // the message that asked, so it can be updated in place
+	expires time.Time
 }
 
 // album collects the photos of one Telegram media group: they arrive as
@@ -92,6 +101,7 @@ func NewGateway(ctx context.Context, cfg *Config, store *Store) *Gateway {
 		modelsBy: map[string]modelCacheEntry{},
 		skillsBy: map[string]skillCacheEntry{},
 		albums:   map[string]*album{},
+		waiting:  map[int]*fileWait{},
 	}
 }
 
@@ -227,7 +237,7 @@ func (gw *Gateway) handleMessage(m *TGMessage) {
 		return
 	}
 
-	if m.Document != nil || len(m.Photo) > 0 {
+	if fileID, _, _ := mediaOf(m); fileID != "" {
 		gw.handleUpload(m, thread)
 		return
 	}
@@ -248,6 +258,14 @@ func (gw *Gateway) handleMessage(m *TGMessage) {
 	sess := gw.store.Get(thread)
 	if sess == nil {
 		gw.offerBind(thread, "There is no session in this topic yet.")
+		return
+	}
+	// A file arrived earlier with nothing to do: this message is what to do.
+	if held, ask := gw.takeHeldFiles(thread); len(held) > 0 {
+		if ask > 0 {
+			_ = gw.tg.EditKeyboard(gw.ctx, gw.cfg.ChatID, ask, nil)
+		}
+		gw.submitWithFiles(sess, text, held)
 		return
 	}
 	gw.submit(sess, text)
@@ -295,12 +313,17 @@ func (gw *Gateway) submitWithFiles(sess *Session, caption string, paths []string
 	} else if len(images) > 0 {
 		b.WriteString("Look at this and tell me what you see.")
 	}
-	// Images are handed to the agent as images; other files only need naming.
-	for _, p := range others {
+	// Images are handed to the agent as images; anything else is named, with
+	// the kind spelled out so it knows what it is dealing with.
+	if len(others) > 0 {
 		if b.Len() > 0 {
 			b.WriteString("\n\n")
 		}
-		b.WriteString("Attached file: " + p)
+		if len(others) == 1 {
+			b.WriteString("Attached file: " + others[0])
+		} else {
+			b.WriteString("Attached files:\n" + strings.Join(others, "\n"))
+		}
 	}
 	gw.submitPrompt(sess, strings.TrimSpace(b.String()), images)
 }
@@ -624,38 +647,90 @@ func onOff(b bool) string {
 
 // ---------------------------------------------------------------- uploads
 
+// mediaOf pulls the one attachment out of a message, whatever kind it is.
+func mediaOf(m *TGMessage) (fileID, name, kind string) {
+	switch {
+	case m.Document != nil:
+		return m.Document.FileID, m.Document.FileName, "file"
+	case len(m.Photo) > 0:
+		// The last size is the largest one Telegram kept.
+		return m.Photo[len(m.Photo)-1].FileID, "", "photo"
+	case m.Video != nil:
+		return m.Video.FileID, m.Video.FileName, "video"
+	case m.Animation != nil:
+		return m.Animation.FileID, m.Animation.FileName, "animation"
+	case m.Audio != nil:
+		return m.Audio.FileID, m.Audio.FileName, "audio"
+	case m.Voice != nil:
+		return m.Voice.FileID, "", "voice message"
+	case m.VideoNote != nil:
+		return m.VideoNote.FileID, "", "video note"
+	case m.Sticker != nil:
+		return m.Sticker.FileID, "", "sticker"
+	}
+	return "", "", ""
+}
+
+// defaultName invents a filename for the attachments Telegram sends without
+// one, using the mime type so the extension is right.
+func defaultName(m *TGMessage, kind string) string {
+	mime := ""
+	for _, f := range []*TGFile{m.Video, m.Audio, m.Voice, m.VideoNote, m.Animation, m.Sticker, m.Document} {
+		if f != nil && f.MimeType != "" {
+			mime = f.MimeType
+			break
+		}
+	}
+	ext := map[string]string{
+		"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif",
+		"video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm",
+		"audio/mpeg": ".mp3", "audio/ogg": ".ogg", "audio/mp4": ".m4a", "audio/wav": ".wav",
+		"application/pdf": ".pdf", "application/zip": ".zip", "text/plain": ".txt",
+	}[mime]
+	if ext == "" {
+		switch kind {
+		case "photo":
+			ext = ".jpg"
+		case "voice message":
+			ext = ".ogg"
+		case "video", "video note", "animation":
+			ext = ".mp4"
+		case "sticker":
+			ext = ".webp"
+		default:
+			ext = ".bin"
+		}
+	}
+	base := strings.ReplaceAll(kind, " ", "_")
+	return fmt.Sprintf("%s_%d%s", base, m.MessageID, ext)
+}
+
 func (gw *Gateway) handleUpload(m *TGMessage, thread int) {
 	sess := gw.store.Get(thread)
 	dir := gw.cfg.DefaultCwd
 	if sess != nil {
 		dir = sess.Cwd
 	}
-	var fileID, name string
-	switch {
-	case m.Document != nil:
-		fileID, name = m.Document.FileID, m.Document.FileName
-	case len(m.Photo) > 0:
-		// The last size is the largest one Telegram kept.
-		fileID = m.Photo[len(m.Photo)-1].FileID
-		name = fmt.Sprintf("photo_%d.jpg", m.MessageID)
-	}
+	fileID, name, kind := mediaOf(m)
 	if fileID == "" {
 		return
 	}
+	if name == "" {
+		name = defaultName(m, kind)
+	}
 	path, err := gw.tg.Download(gw.ctx, fileID, dir, name)
 	if err != nil {
-		gw.reply(thread, "⚠️ could not save that file: "+html.EscapeString(err.Error()), nil)
+		gw.reply(thread, "⚠️ could not save that "+kind+": "+html.EscapeString(friendlyDownloadError(err)), nil)
 		return
 	}
 	caption := strings.TrimSpace(m.Caption)
 
 	// An album arrives as several messages, and usually only one of them
-	// carries the caption, so they are collected before the agent is asked.
+	// carries the caption, so they are collected before anything is decided.
 	if m.MediaGroupID != "" && sess != nil {
 		gw.collectAlbum(m.MediaGroupID, thread, path, caption)
 		return
 	}
-
 	if sess == nil {
 		gw.reply(thread, "📎 saved to <code>"+html.EscapeString(path)+"</code>", nil)
 		return
@@ -665,16 +740,76 @@ func (gw *Gateway) handleUpload(m *TGMessage, thread int) {
 		gw.submitWithFiles(sess, caption, []string{path})
 		return
 	}
-	msg := gw.reply(thread, "📎 saved to <code>"+html.EscapeString(path)+"</code>", Rows(
-		[]Button{{Text: "👀 Ask the agent to look at it", CallbackData: "look"}},
-	))
-	if msg != nil {
-		gw.rememberMenu(msg.MessageID, &pending{kind: "look", dirs: []string{path}, threadID: thread})
+	// No caption: hold the file and ask. Nothing runs until the next message
+	// says what to do with it.
+	gw.holdFile(thread, path)
+}
+
+// friendlyDownloadError says what to do about the one failure that is common.
+func friendlyDownloadError(err error) string {
+	msg := err.Error()
+	if strings.Contains(strings.ToLower(msg), "too big") {
+		return "Telegram only lets a bot fetch files up to 20 MB. Put it somewhere on the server and tell the agent the path instead."
+	}
+	return msg
+}
+
+// holdFile keeps an uncaptioned file until the next message explains it.
+func (gw *Gateway) holdFile(thread int, paths ...string) {
+	gw.mu.Lock()
+	w := gw.waiting[thread]
+	if w == nil || time.Now().After(w.expires) {
+		w = &fileWait{}
+		gw.waiting[thread] = w
+	}
+	w.paths = append(w.paths, paths...)
+	w.expires = time.Now().Add(2 * time.Hour)
+	ask := w.askedAt
+	held := append([]string(nil), w.paths...)
+	gw.mu.Unlock()
+
+	var b strings.Builder
+	if len(held) == 1 {
+		b.WriteString("📎 <code>" + html.EscapeString(filepath.Base(held[0])) + "</code> is saved.\n\n")
+	} else {
+		fmt.Fprintf(&b, "📎 %d files are saved:\n", len(held))
+		for _, p := range held {
+			b.WriteString("· <code>" + html.EscapeString(filepath.Base(p)) + "</code>\n")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("<b>What should I do with it?</b>\nSend me the instruction and I will pass it to the agent along with the file.")
+	kb := Rows([]Button{{Text: "✖️ Forget it", CallbackData: "unhold"}})
+
+	if ask > 0 {
+		if err := gw.tg.Edit(gw.ctx, gw.cfg.ChatID, ask, b.String(), kb); err == nil {
+			return
+		}
+	}
+	if msg := gw.reply(thread, b.String(), kb); msg != nil {
+		gw.mu.Lock()
+		if w := gw.waiting[thread]; w != nil {
+			w.askedAt = msg.MessageID
+		}
+		gw.mu.Unlock()
 	}
 }
 
-// collectAlbum holds the photos of one media group for a moment, then sends
-// them to the agent as a single message.
+// takeHeldFiles hands over the files waiting in a topic, if any.
+func (gw *Gateway) takeHeldFiles(thread int) ([]string, int) {
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	w := gw.waiting[thread]
+	if w == nil {
+		return nil, 0
+	}
+	delete(gw.waiting, thread)
+	if time.Now().After(w.expires) {
+		return nil, w.askedAt
+	}
+	return w.paths, w.askedAt
+}
+
 func (gw *Gateway) collectAlbum(groupID string, thread int, path, caption string) {
 	gw.mu.Lock()
 	a := gw.albums[groupID]
@@ -712,10 +847,12 @@ func (gw *Gateway) flushAlbum(groupID string) {
 	if sess == nil {
 		return
 	}
-	gw.reply(a.thread, fmt.Sprintf("📎 saved %d files to <code>%s</code>", len(a.paths), html.EscapeString(sess.Cwd)), nil)
 	if a.caption == "" {
-		a.caption = "Look at these files."
+		// No caption on any of them: hold them all and ask once.
+		gw.holdFile(a.thread, a.paths...)
+		return
 	}
+	gw.reply(a.thread, fmt.Sprintf("📎 saved %d files to <code>%s</code>", len(a.paths), html.EscapeString(sess.Cwd)), nil)
 	gw.submitWithFiles(sess, a.caption, a.paths)
 }
 

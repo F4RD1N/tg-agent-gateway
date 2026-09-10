@@ -33,12 +33,18 @@ type TGChat struct {
 	IsForum bool   `json:"is_forum"`
 }
 
-type TGDocument struct {
+// TGFile covers every attachment Telegram sends that is not a photo: they
+// all carry the same handful of fields.
+type TGFile struct {
 	FileID   string `json:"file_id"`
 	FileName string `json:"file_name"`
 	FileSize int64  `json:"file_size"`
 	MimeType string `json:"mime_type"`
+	Duration int    `json:"duration"`
+	Emoji    string `json:"emoji"`
 }
+
+type TGDocument = TGFile
 
 type TGPhotoSize struct {
 	FileID   string `json:"file_id"`
@@ -57,8 +63,14 @@ type TGMessage struct {
 	Text            string        `json:"text"`
 	Caption         string        `json:"caption"`
 	MediaGroupID    string        `json:"media_group_id"`
-	Document        *TGDocument   `json:"document"`
+	Document        *TGFile       `json:"document"`
 	Photo           []TGPhotoSize `json:"photo"`
+	Video           *TGFile       `json:"video"`
+	Audio           *TGFile       `json:"audio"`
+	Voice           *TGFile       `json:"voice"`
+	VideoNote       *TGFile       `json:"video_note"`
+	Animation       *TGFile       `json:"animation"`
+	Sticker         *TGFile       `json:"sticker"`
 	ForumTopic      *struct {
 		Name string `json:"name"`
 	} `json:"forum_topic_created"`

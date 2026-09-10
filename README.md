@@ -70,11 +70,14 @@ does kill everything that session started.
 - **It manages the topics.** It creates, renames, closes and deletes them,
   and on startup it gives every remembered session a topic again, recreating
   any that were deleted while it was down.
-- **Photos and files both ways.** Send a photo with a caption and the agent
-  looks at the picture and does what the caption says; Codex is handed the
-  image directly, Claude opens it with its Read tool. An album of photos
-  arrives as one message. Any file lands in the session's folder, and
-  `/get path` sends one back. Agents deliver
+- **Anything you send, with the caption as the prompt.** Photos, documents,
+  video, audio, voice notes, animations, stickers - all of them land in the
+  session's folder and the caption becomes the instruction. A picture is
+  handed to the agent as an image (Codex takes it directly, Claude opens it
+  with its Read tool); anything else is named for it. An album arrives as one
+  message. **Send a file with no caption and the bot asks what to do with it**,
+  holding the file until your next message, so an attachment alone never
+  starts a turn. `/get path` sends a file back. Agents deliver
   with `tg-send <file>`, which the gateway points at that session's own topic
   through `AGENT_TG_*` in their environment, so builds and archives never go
   to a private chat again. `/run` executes a shell command in the folder.
