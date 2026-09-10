@@ -16,14 +16,22 @@ type Choice struct {
 }
 
 type Config struct {
-	BotToken       string   `json:"bot_token"`
-	ChatID         int64    `json:"chat_id"`
-	AllowedUserIDs []int64  `json:"allowed_user_ids"`
+	BotToken       string  `json:"bot_token"`
+	ChatID         int64   `json:"chat_id"`
+	AllowedUserIDs []int64 `json:"allowed_user_ids"`
+	// AdminUserIDs may run the whole gateway: the session list, new sessions,
+	// every topic. Anyone else the bot answers is a guest, confined to the
+	// isolated topics they were given. Empty means every allowed user is an
+	// admin, which is what a one-person install wants.
+	AdminUserIDs   []int64  `json:"admin_user_ids,omitempty"`
 	DefaultCwd     string   `json:"default_cwd"`
 	WorkspaceRoots []string `json:"workspace_roots"`
 	StatePath      string   `json:"state_path"`
 	APIBase        string   `json:"api_base,omitempty"`
 	BridgeCmd      []string `json:"bridge_cmd"`
+	// IsolatedRoot is where sandboxed sessions get their folders, one per
+	// agent and then one per session. Nothing outside it is visible to them.
+	IsolatedRoot string `json:"isolated_root,omitempty"`
 
 	EditIntervalMS  int  `json:"edit_interval_ms"`
 	MaxMessageChars int  `json:"max_message_chars"`
@@ -45,6 +53,7 @@ func DefaultConfig() *Config {
 		DefaultCwd:      "/root",
 		WorkspaceRoots:  []string{"/root"},
 		StatePath:       "/var/lib/tg-agent-gateway/state.json",
+		IsolatedRoot:    "/root/isolated",
 		APIBase:         "https://api.telegram.org",
 		BridgeCmd:       []string{"node", "/opt/tg-agent-gateway/bridge/index.mjs"},
 		EditIntervalMS:  2500,
@@ -128,6 +137,9 @@ func LoadConfig(path string) (*Config, error) {
 	if c.APIBase == "" {
 		c.APIBase = "https://api.telegram.org"
 	}
+	if c.IsolatedRoot == "" {
+		c.IsolatedRoot = d.IsolatedRoot
+	}
 	c.path = path
 	return c, nil
 }
@@ -149,6 +161,21 @@ func (c *Config) Save(path string) error {
 
 func (c *Config) UserAllowed(id int64) bool {
 	for _, u := range c.AllowedUserIDs {
+		if u == id {
+			return true
+		}
+	}
+	return false
+}
+
+// IsAdmin reports whether this user runs the gateway rather than being a
+// guest in one topic of it. With no admin list configured, everyone the bot
+// answers is an admin.
+func (c *Config) IsAdmin(id int64) bool {
+	if len(c.AdminUserIDs) == 0 {
+		return c.UserAllowed(id)
+	}
+	for _, u := range c.AdminUserIDs {
 		if u == id {
 			return true
 		}

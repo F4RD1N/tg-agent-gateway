@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# Run a command inside an isolated session.
+#
+# The point of this script is a boundary somebody else can work behind. The
+# agent gets a real machine - system commands, compilers, the network, root
+# inside its own namespace - but it cannot see /root, so it cannot read this
+# server's other projects, the saved memories, the settings or anybody else's
+# session history. It also cannot see the parts of /etc that hold secrets:
+# this bot's own token, the panel database, the TLS private keys, the SSH host
+# keys and the password hashes all stay outside.
+#
+#   sandbox-run <session dir> <command> [args...]
+#
+# What is inside: the system read-only, a private /tmp, a home that lives in
+# the session directory, the session directory itself writable, the agent
+# binaries, and each agent's login credential so it can authenticate. Nothing
+# else from /root is bound in.
+set -euo pipefail
+
+DIR="${1:?usage: sandbox-run <session dir> <command> [args...]}"
+shift
+[ -d "$DIR" ] || { echo "sandbox-run: no such directory: $DIR" >&2; exit 1; }
+command -v bwrap >/dev/null || { echo "sandbox-run: bubblewrap (bwrap) is not installed" >&2; exit 1; }
+
+HOME_REAL="${SANDBOX_HOME_SOURCE:-/root}"
+GUEST_HOME=/home/agent
+# The session folder appears at a path of its own, so /root is not merely
+# empty in here, it does not exist.
+GUEST_WORK="${SANDBOX_WORKDIR:-/workspace}"
+DIR="$(readlink -f "$DIR")"
+
+# The home lives inside the session directory, so an agent's own state - the
+# conversation history it needs in order to resume - survives a restart and
+# still goes away with the session.
+GUEST_STATE="$DIR/.home"
+mkdir -p "$GUEST_STATE"
+
+# A passwd and group file naming exactly one user, so anything that looks up
+# who it is gets an answer without seeing the machine's accounts. These are
+# the same for every sandbox, so they are written once, outside the session
+# folders where they would only be clutter.
+ETC="${SANDBOX_ETC:-/run/tg-agent-gateway/sandbox-etc}"
+mkdir -p "$ETC" 2>/dev/null || ETC="$DIR/.sandbox-etc"
+mkdir -p "$ETC"
+printf 'root:x:0:0:agent:%s:/bin/bash\n' "$GUEST_HOME" > "$ETC/passwd"
+printf 'root:x:0:\nnogroup:x:65534:\n' > "$ETC/group"
+printf 'sandbox\n' > "$ETC/hostname"
+
+args=(
+  --ro-bind /usr /usr
+  --proc /proc
+  --dev /dev
+  --tmpfs /tmp
+  --tmpfs /var
+  --tmpfs /run
+  --tmpfs /opt
+  --tmpfs /srv
+  --tmpfs /etc
+  --tmpfs /usr/local/bin
+  --bind "$GUEST_STATE" "$GUEST_HOME"
+  --bind "$DIR" "$GUEST_WORK"
+  --chdir "$GUEST_WORK"
+  --setenv HOME "$GUEST_HOME"
+  --setenv USER root
+  --setenv LOGNAME root
+  --setenv TMPDIR /tmp
+  --setenv SHELL /bin/bash
+  --setenv IS_SANDBOX 1
+  --setenv AGENT_SANDBOX 1
+  --setenv AGENT_OUTBOX "$GUEST_WORK/outbox"
+  --setenv PATH "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+  --unshare-user
+  --unshare-pid
+  --unshare-ipc
+  --unshare-uts
+  --uid 0
+  --gid 0
+  --hostname sandbox
+  --die-with-parent
+  --new-session
+)
+
+# /bin, /sbin and /lib are symlinks into /usr on a merged-/usr system and real
+# directories on others; reproduce whichever this machine has, or nothing at
+# all will be able to start.
+for d in /bin /sbin /lib /lib64 /lib32; do
+  if [ -L "$d" ]; then
+    args+=(--symlink "$(readlink "$d")" "$d")
+  elif [ -d "$d" ]; then
+    args+=(--ro-bind "$d" "$d")
+  fi
+done
+
+bind_ro() { # bind_ro <source> [destination]
+  [ -e "$1" ] || return 0
+  args+=(--ro-bind "$1" "${2:-$1}")
+}
+bind_rw() { # bind_rw <source> <destination>
+  [ -e "$1" ] || return 0
+  args+=(--bind "$1" "$2")
+}
+
+# A minimal /etc: the pieces every program expects, and nothing that belongs
+# to this machine's own services.
+bind_ro "$ETC/passwd" /etc/passwd
+bind_ro "$ETC/group" /etc/group
+bind_ro "$ETC/hostname" /etc/hostname
+for f in \
+  /etc/resolv.conf /etc/hosts /etc/host.conf /etc/nsswitch.conf /etc/gai.conf \
+  /etc/services /etc/protocols /etc/networks \
+  /etc/ssl /etc/ca-certificates /etc/ca-certificates.conf /etc/pki \
+  /etc/ld.so.cache /etc/ld.so.conf /etc/ld.so.conf.d /etc/alternatives \
+  /etc/localtime /etc/timezone /etc/locale.conf /etc/locale.alias /etc/locale.gen \
+  /etc/os-release /etc/lsb-release /etc/debian_version /etc/issue \
+  /etc/mime.types /etc/magic /etc/magic.mime /etc/terminfo /etc/fonts \
+  /etc/profile /etc/profile.d /etc/bash.bashrc /etc/bash_completion /etc/bash_completion.d \
+  /etc/inputrc /etc/shells /etc/login.defs /etc/environment \
+  /etc/python3 /etc/python3.12 /etc/perl /etc/java-21-openjdk /etc/dpkg /etc/apt \
+  /etc/xdg /etc/security /etc/pam.d /etc/mke2fs.conf
+do
+  bind_ro "$f"
+done
+
+# The agent binaries, by their real path: the usual ones live under /root,
+# which does not exist in here. Only the executable itself is bound, plus any
+# helper that has to sit beside it, so nothing of /root comes along with them.
+bind_agent() { # bind_agent <name>
+  local name="$1" src dir helper
+  src="$(command -v "$name" 2>/dev/null || true)"
+  [ -n "$src" ] || src="$HOME_REAL/.local/bin/$name"
+  src="$(readlink -f "$src" 2>/dev/null || true)"
+  [ -n "$src" ] && [ -x "$src" ] || return 0
+  args+=(--ro-bind "$src" "/usr/local/bin/$name")
+  dir="$(dirname "$src")"
+  for helper in "$dir/$name"-*; do
+    [ -x "$helper" ] || continue
+    args+=(--ro-bind "$helper" "/usr/local/bin/$(basename "$helper")")
+  done
+}
+bind_agent claude
+bind_agent codex
+bind_agent agy
+
+# node, so the bridge's worker can run in here. It is a single executable and
+# needs nothing beside it.
+NODE_BIN="$(readlink -f "$(command -v node 2>/dev/null || true)" 2>/dev/null || true)"
+[ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ] && args+=(--ro-bind "$NODE_BIN" /usr/local/bin/node)
+
+# The gateway's own code, at a path of its own, so the worker can be started
+# without the machine's directory layout showing through.
+if [ -n "${SANDBOX_BRIDGE:-}" ] && [ -d "$SANDBOX_BRIDGE" ]; then
+  args+=(--ro-bind "$SANDBOX_BRIDGE" /opt/bridge)
+fi
+
+# tg-send, in the form that works in here: it queues a file in the outbox for
+# the gateway to post, because the bot token stays outside.
+HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$HERE_DIR/tg-send-outbox" ]; then
+  args+=(--ro-bind "$HERE_DIR/tg-send-outbox" /usr/local/bin/tg-send)
+fi
+# svc, the stand-in for systemd in here: there is no init to talk to, so this
+# is how a website or a worker is kept running between messages.
+if [ -f "$HERE_DIR/svc" ]; then
+  args+=(--ro-bind "$HERE_DIR/svc" /usr/local/bin/svc)
+  args+=(--setenv AGENT_SERVICES "$GUEST_WORK/.services")
+fi
+
+# Just enough of each agent's configuration to log in. These are bound
+# writable because the agents refresh their own tokens; everything else about
+# them - conversation history, memories, project settings - stays outside.
+bind_rw "$HOME_REAL/.claude/.credentials.json" "$GUEST_HOME/.claude/.credentials.json"
+bind_rw "$HOME_REAL/.codex/auth.json" "$GUEST_HOME/.codex/auth.json"
+bind_rw "$HOME_REAL/.gemini/antigravity-cli/antigravity-oauth-token" "$GUEST_HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+# Antigravity's built-in skills come from its install and carry no data.
+bind_ro "$HOME_REAL/.gemini/antigravity-cli/builtin" "$GUEST_HOME/.gemini/antigravity-cli/builtin"
+
+# Anything else the caller needs read-only, such as the bridge's own code.
+if [ -n "${SANDBOX_RO_BINDS:-}" ]; then
+  IFS=: read -r -a extra <<< "$SANDBOX_RO_BINDS"
+  for p in "${extra[@]}"; do
+    [ -n "$p" ] && bind_ro "$p"
+  done
+fi
+
+# SANDBOX_RESUME asks for the session's own services to be brought back before
+# the command runs, which is what makes a website survive a restart. It is
+# harmless to repeat: svc skips whatever is already running.
+if [ -n "${SANDBOX_RESUME:-}" ] && [ -f "$HERE_DIR/svc" ]; then
+  exec bwrap "${args[@]}" /bin/sh -c 'svc resume --quiet >/dev/null 2>&1 || true; exec "$@"' sandbox-run "$@"
+fi
+
+exec bwrap "${args[@]}" "$@"

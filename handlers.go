@@ -19,8 +19,8 @@ Each topic in this group is one agent session. Write a message in a topic and it
 /new — start one (I create the topic)
 /new My Project — name the topic yourself
 /rename &lt;name&gt; — rename this topic
-/sessions — list them
-/end — finish this one
+/sessions — browse past conversations and take one up again
+/end — close the topic, or delete it and keep the session
 
 <b>This topic</b>
 /model /agent /effort — pick with buttons
@@ -39,11 +39,27 @@ Each topic in this group is one agent session. Write a message in a topic and it
 /status — what this session is
 /verbose — show tool output and thinking
 
+<b>Isolated sessions</b>
+A sandbox session works in a folder of its own and sees nothing else of this server: no other projects, no memories, no settings. Pick <b>Isolated sandbox</b> instead of a folder when starting one, and say whether it is for you or for somebody else. A session made for somebody else answers only them.
+/services — what that session keeps running (there is no systemd inside; use <code>svc</code>)
+
 Send a file to a topic and it lands in that session's folder. Anything else starting with / goes to the agent, so Claude's own commands work.`
+
+// adminCommands are the ones that reach past a single topic: the list of what
+// is running, starting something new, and taking a topic away. A guest given a
+// sandbox has none of them.
+var adminCommands = map[string]bool{
+	"new": true, "sessions": true, "list": true, "end": true, "resume": true, "attach": true,
+}
 
 func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 	cmd, arg := splitCommand(text)
 	sess := gw.store.Get(thread)
+
+	if adminCommands[cmd] && !gw.mayList(m.From.ID) {
+		gw.adminOnly(thread)
+		return
+	}
 
 	switch cmd {
 	case "start", "help":
@@ -149,7 +165,7 @@ func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 		})
 	case "pwd":
 		gw.needSession(thread, sess, func(s *Session) {
-			gw.reply(thread, "📁 <code>"+html.EscapeString(s.Cwd)+"</code>", nil)
+			gw.reply(thread, "📁 <code>"+html.EscapeString(guestPath(s, s.Cwd))+"</code>", nil)
 		})
 	case "cd":
 		gw.needSession(thread, sess, func(s *Session) {
@@ -163,9 +179,14 @@ func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 		gw.needSession(thread, sess, func(s *Session) {
 			dir := s.Cwd
 			if arg != "" {
-				dir = resolvePath(s.Cwd, arg)
+				p, err := hostPath(s, s.Cwd, arg)
+				if err != nil {
+					gw.reply(thread, "⚠️ "+html.EscapeString(err.Error()), nil)
+					return
+				}
+				dir = p
 			}
-			gw.runShell(thread, dir, "ls -la --color=never")
+			gw.runShell(thread, s, dir, "ls -la --color=never")
 		})
 	case "get":
 		gw.needSession(thread, sess, func(s *Session) {
@@ -173,12 +194,16 @@ func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 				gw.reply(thread, "Usage: <code>/get path/to/file</code>", nil)
 				return
 			}
-			p := resolvePath(s.Cwd, arg)
-			if !gw.cfg.PathAllowed(p) {
+			p, err := hostPath(s, s.Cwd, arg)
+			if err != nil {
+				gw.reply(thread, "⚠️ "+html.EscapeString(err.Error()), nil)
+				return
+			}
+			if !gw.pathAllowed(s, p) {
 				gw.reply(thread, "That path is outside the allowed roots.", nil)
 				return
 			}
-			if err := gw.tg.SendDocument(gw.ctx, gw.cfg.ChatID, thread, p, "<code>"+html.EscapeString(p)+"</code>"); err != nil {
+			if err := gw.tg.SendDocument(gw.ctx, gw.cfg.ChatID, thread, p, "<code>"+html.EscapeString(guestPath(s, p))+"</code>"); err != nil {
 				gw.reply(thread, "⚠️ "+html.EscapeString(err.Error()), nil)
 			}
 		})
@@ -188,7 +213,20 @@ func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 				gw.reply(thread, "Usage: <code>/run ls -la</code>", nil)
 				return
 			}
-			go gw.runShell(thread, s.Cwd, arg)
+			go gw.runShell(thread, s, s.Cwd, arg)
+		})
+	case "services", "svc":
+		gw.needSession(thread, sess, func(s *Session) {
+			if !s.Isolated {
+				gw.reply(thread, "Services are part of isolated sessions, which have no systemd of their own. "+
+					"This topic works on the machine directly, so use systemd here.", nil)
+				return
+			}
+			cmdline := "svc list"
+			if arg != "" {
+				cmdline = "svc " + arg
+			}
+			go gw.runShell(thread, s, s.Cwd, cmdline)
 		})
 	default:
 		// Unknown slash commands belong to the agent (Claude's /compact and
@@ -474,9 +512,11 @@ func (gw *Gateway) renderConfigChoice(thread, editMsg int, sess *Session, o *con
 
 // askEnd offers the two ways a topic can go away, both on buttons.
 func (gw *Gateway) askEnd(thread int) {
-	gw.reply(thread, "End this session?", Rows(
+	gw.reply(thread, "End this session?\n\n<i>Keeping the conversation means the topic goes "+
+		"but the session stays: find it again under /sessions and resume it in a new topic.</i>", Rows(
 		[]Button{{Text: "🔒 Close the topic", CallbackData: "end:close"}},
-		[]Button{{Text: "🗑 Delete the topic", CallbackData: "end:delete"}},
+		[]Button{{Text: "📥 Delete topic, keep session", CallbackData: "end:keep"}},
+		[]Button{{Text: "🗑 Delete both", CallbackData: "end:delete"}},
 		[]Button{{Text: "Cancel", CallbackData: "dismiss"}},
 	))
 }
@@ -752,15 +792,20 @@ func (gw *Gateway) runSkill(thread int, sess *Session, sk SkillInfo, args string
 // askTopicName is the last step of creating a session: what the topic should
 // be called. The agent goes in front of whatever you pick, so "VPN App"
 // becomes "Claude • VPN App".
-func (gw *Gateway) askTopicName(thread, editMsg int, agent, cwd string) {
+func (gw *Gateway) askTopicName(thread, editMsg int, agent, cwd string, iso ...*pending) {
 	suggestion := filepath.Base(strings.TrimRight(cwd, "/"))
+	menu := &pending{kind: "newname", agent: agent, dirs: []string{cwd}, threadID: thread}
+	if len(iso) > 0 && iso[0] != nil {
+		menu.isolated = iso[0].isolated
+		menu.owner = iso[0].owner
+		suggestion = "Sandbox"
+	}
 	kb := Rows(
 		[]Button{{Text: "⌨️ Type a name", CallbackData: "newname:type"}},
 		[]Button{{Text: "📁 " + truncate(suggestion, 30), CallbackData: "newname:auto"}},
 	)
 	title := "What should this topic be called?\n<i>" +
 		html.EscapeString(topicTitle(agent, "your name here")) + "</i>"
-	menu := &pending{kind: "newname", agent: agent, dirs: []string{cwd}, threadID: thread}
 	if editMsg > 0 {
 		gw.rememberMenu(editMsg, menu)
 		if err := gw.tg.Edit(gw.ctx, gw.cfg.ChatID, editMsg, title, kb); err == nil {
@@ -772,11 +817,117 @@ func (gw *Gateway) askTopicName(thread, editMsg int, agent, cwd string) {
 	}
 }
 
+// ------------------------------------------------------- isolated sessions
+
+// askWhoFor is the question that decides what an isolated session is for. A
+// sandbox kept for yourself behaves like any other topic. One made for
+// somebody else belongs to them alone: they are the only person the bot will
+// answer in it, and the folder is all they can see of this machine.
+func (gw *Gateway) askWhoFor(thread, editMsg int, agent string) {
+	menu := &pending{kind: "isoowner", agent: agent, threadID: thread, isolated: true}
+	kb := Rows(
+		[]Button{{Text: "🙋 For me", CallbackData: "iso:mine"}},
+		[]Button{{Text: "👤 For someone else", CallbackData: "iso:guest"}},
+		[]Button{{Text: "Cancel", CallbackData: "dismiss"}},
+	)
+	text := "<b>Isolated session</b> — " + agentLabel(agent) + "\n\n" +
+		"It gets a folder of its own and sees nothing else of this server: no other " +
+		"projects, no memories, no settings, no other session. Commands, compilers " +
+		"and the network all work in there.\n\nWho is it for?"
+	if editMsg > 0 {
+		gw.rememberMenu(editMsg, menu)
+		if err := gw.tg.Edit(gw.ctx, gw.cfg.ChatID, editMsg, text, kb); err == nil {
+			return
+		}
+	}
+	if m := gw.reply(thread, text, kb); m != nil {
+		gw.rememberMenu(m.MessageID, menu)
+	}
+}
+
+// askGuestID asks for the Telegram id of the person the sandbox is for.
+func (gw *Gateway) askGuestID(thread, editMsg int, agent string, userID int64) {
+	gw.awaitPath(userID, &pending{kind: "isoguest", agent: agent, threadID: thread, isolated: true})
+	text := "Send me the <b>Telegram user id</b> of the person this session is for.\n\n" +
+		"They will be the only one who can use that topic — you included. " +
+		"Ask them to send <code>/id</code> here if they do not know theirs."
+	gw.notify(thread, editMsg, text, Rows([]Button{{Text: "Cancel", CallbackData: "dismiss"}}))
+}
+
+// startIsolated creates the folder and the session behind it.
+func (gw *Gateway) startIsolated(thread int, agent, name string, owner int64, editMsg int) {
+	dir, err := gw.makeIsolatedDir(agent)
+	if err != nil {
+		gw.notify(thread, editMsg, "⚠️ "+html.EscapeString(err.Error()))
+		return
+	}
+	sess, err := gw.createSessionIn(agent, dir, name, 0, true)
+	if err != nil {
+		gw.notify(thread, editMsg, "⚠️ "+html.EscapeString(err.Error()))
+		return
+	}
+	if owner != 0 {
+		sess = gw.store.Update(sess.ThreadID, func(s *Session) { s.OwnerID = owner })
+		if sess == nil {
+			return
+		}
+		// The session already went to the bridge without an owner; nothing
+		// about the sandbox changes, but keep the two in step.
+		_ = gw.bridge.Send(gw.command("start", sess, ""))
+	}
+
+	link := TopicLink(gw.cfg.ChatID, sess.ThreadID)
+	text := "🔒 <b>Isolated " + agentLabel(agent) + "</b> is ready.\n" +
+		"📁 <code>" + html.EscapeString(dir) + "</code>\n" +
+		"<i>seen from inside as /workspace</i>"
+	if owner != 0 {
+		text += "\n👤 for <code>" + strconv.FormatInt(owner, 10) + "</code> only"
+	}
+	gw.notify(thread, editMsg, text, Rows([]Button{{Text: "➡️ Open the topic", URL: link}}))
+
+	header := gw.sessionHeader(sess) + "\n\n" + isolatedWelcome(owner)
+	if m := gw.reply(sess.ThreadID, header, gw.sessionKeyboard(sess)); m != nil {
+		_ = gw.tg.Pin(gw.ctx, gw.cfg.ChatID, m.MessageID)
+	}
+}
+
+func isolatedWelcome(owner int64) string {
+	s := "This session is <b>isolated</b>. It works in <code>/workspace</code>, which is " +
+		"the only folder that exists for it: the rest of this server — other projects, " +
+		"memories, settings, other sessions — is not there at all. Shell commands, " +
+		"package tools and the network all work normally.\n\n" +
+		"There is no systemd in here. To keep something running — a website, an API, a " +
+		"worker — use <code>svc</code>:\n" +
+		"<code>svc start web npm run dev</code>\n" +
+		"<code>svc list</code> · <code>svc log web</code> · <code>svc stop web</code>\n" +
+		"A service started that way keeps running between messages and is brought back " +
+		"if the session restarts. Ports it opens are reachable from outside.\n\n" +
+		"Send a file back with <code>tg-send &lt;path&gt;</code> and it arrives in this topic."
+	if owner != 0 {
+		s += "\n\nThis topic is yours alone."
+	}
+	return s
+}
+
 // ---------------------------------------------------------------- pickers
 
 func (gw *Gateway) showDirs(thread int, dir, kind, agent, name string, editMsg int) {
+	// In an isolated topic the picker is the sandbox's own tree and nothing
+	// above it: there is no rest of the machine to browse to.
+	var iso *Session
+	if kind == "cd" {
+		if s := gw.store.Get(thread); s != nil && s.Isolated {
+			iso = s
+			if !within(sandboxRoot(s), dir) {
+				dir = sandboxRoot(s)
+			}
+		}
+	}
 	dirs := gw.subdirs(dir)
 	recent := gw.store.RecentDirs(4)
+	if iso != nil {
+		recent = nil
+	}
 	var buttons []Button
 	list := []string{}
 	add := func(p, label string) {
@@ -793,7 +944,11 @@ func (gw *Gateway) showDirs(thread int, dir, kind, agent, name string, editMsg i
 	}
 	kb := Grid(2, buttons)
 	nav := []Button{}
-	if parent := filepath.Dir(dir); parent != dir {
+	parent := filepath.Dir(dir)
+	if iso != nil && !within(sandboxRoot(iso), parent) {
+		parent = dir // the sandbox root has no "up"
+	}
+	if parent != dir {
 		list = append(list, parent)
 		nav = append(nav, Button{Text: "⬆️ up", CallbackData: kind + ":" + strconv.Itoa(len(list)-1)})
 	}
@@ -802,10 +957,16 @@ func (gw *Gateway) showDirs(thread int, dir, kind, agent, name string, editMsg i
 		Button{Text: "⌨️ type a path", CallbackData: kind + ":type"},
 	)
 	kb.InlineKeyboard = append(kb.InlineKeyboard, nav)
+	// The other way to answer this question: do not pick a folder at all, and
+	// have the session work in a sandbox of its own instead.
+	if kind == "newdir" && sandboxAvailable() {
+		kb.InlineKeyboard = append(kb.InlineKeyboard,
+			[]Button{{Text: "🔒 Isolated sandbox", CallbackData: "iso:start"}})
+	}
 
 	title := "Folder for the new session:\n<code>" + html.EscapeString(dir) + "</code>"
 	if kind == "cd" {
-		title = "Working folder:\n<code>" + html.EscapeString(dir) + "</code>"
+		title = "Working folder:\n<code>" + html.EscapeString(guestPath(iso, dir)) + "</code>"
 	}
 	menu := &pending{kind: kind, agent: agent, name: name, dirs: append(list, dir), threadID: thread}
 	if editMsg > 0 {
@@ -961,15 +1122,51 @@ func (gw *Gateway) showAgents(thread int, sess *Session, editMsg int) {
 		gw.agentPicker("agt:", sess.Agent))
 }
 
-func (gw *Gateway) cmdSessions(thread int) {
+// cmdSessions opens the session browser: pick an agent, see its last
+// conversations, open one to read what it was about and take it up again in a
+// topic of its own.
+func (gw *Gateway) cmdSessions(thread int, editMsg ...int) {
+	edit := 0
+	if len(editMsg) > 0 {
+		edit = editMsg[0]
+	}
+	var rows [][]Button
+	var pair []Button
+	for _, a := range gw.availableAgents() {
+		pair = append(pair, Button{Text: agentButtonLabel[a], CallbackData: "sessions:" + a})
+		if len(pair) == 2 {
+			rows = append(rows, pair)
+			pair = nil
+		}
+	}
+	if len(pair) > 0 {
+		rows = append(rows, pair)
+	}
+	live := gw.store.List()
+	if len(live) > 0 {
+		rows = append(rows, []Button{{Text: fmt.Sprintf("🗂 Open topics (%d)", len(live)), CallbackData: "sessions:live"}})
+	}
+	rows = append(rows, []Button{{Text: "✨ New session", CallbackData: "new"}})
+	text := "<b>Sessions</b>\nPick an agent to see its last conversations."
+	if len(rows) == 1 {
+		text = noAgentsText()
+	}
+	gw.notify(thread, edit, text, Rows(rows...))
+}
+
+// showLiveTopics lists the sessions that have a topic right now.
+func (gw *Gateway) showLiveTopics(thread, editMsg int) {
 	list := gw.store.List()
 	if len(list) == 0 {
-		gw.reply(thread, "No sessions yet.", Rows([]Button{{Text: "✨ New session", CallbackData: "new"}}))
+		gw.notify(thread, editMsg, "No session has a topic at the moment.", Rows(
+			[]Button{{Text: "✨ New session", CallbackData: "new"}},
+			[]Button{{Text: "⬅️ Back", CallbackData: "sessions"}},
+		))
 		return
 	}
 	var b strings.Builder
 	var buttons []Button
-	b.WriteString("<b>Sessions</b>\n")
+	b.WriteString("<b>Open topics</b>\n")
 	const maxListed = 20
 	extra := 0
 	if len(list) > maxListed {
@@ -977,12 +1174,19 @@ func (gw *Gateway) cmdSessions(thread int) {
 		list = list[:maxListed]
 	}
 	for _, s := range list {
-		b.WriteString(fmt.Sprintf("\n• <b>%s</b> — <code>%s</code>", agentLabel(s.Agent), html.EscapeString(s.Cwd)))
+		lock := ""
+		if s.Isolated {
+			lock = "🔒 "
+		}
+		b.WriteString(fmt.Sprintf("\n• %s<b>%s</b> — <code>%s</code>", lock, agentLabel(s.Agent), html.EscapeString(s.Cwd)))
 		if s.Turns > 0 {
 			b.WriteString(fmt.Sprintf(" · %d turns", s.Turns))
 		}
+		if s.OwnerID != 0 {
+			b.WriteString(fmt.Sprintf(" · for %d", s.OwnerID))
+		}
 		buttons = append(buttons, Button{
-			Text: agentLabel(s.Agent) + " · " + filepath.Base(s.Cwd),
+			Text: lock + agentLabel(s.Agent) + " · " + filepath.Base(s.Cwd),
 			URL:  TopicLink(gw.cfg.ChatID, s.ThreadID),
 		})
 	}
@@ -990,8 +1194,219 @@ func (gw *Gateway) cmdSessions(thread int) {
 		fmt.Fprintf(&b, "\n\n<i>and %d older ones</i>", extra)
 	}
 	kb := Grid(1, buttons)
-	kb.InlineKeyboard = append(kb.InlineKeyboard, []Button{{Text: "✨ New session", CallbackData: "new"}})
-	gw.reply(thread, b.String(), kb)
+	kb.InlineKeyboard = append(kb.InlineKeyboard, []Button{{Text: "⬅️ Back", CallbackData: "sessions"}})
+	gw.notify(thread, editMsg, b.String(), kb)
+}
+
+// pastPerAgent is how many of an agent's conversations the browser lists.
+const pastPerAgent = 10
+
+// showPastSessions lists what this agent still has on disk: the last ten
+// conversations, whether or not they ever had a topic here.
+func (gw *Gateway) showPastSessions(thread, editMsg int, agent string) {
+	msgID := editMsg
+	if msgID > 0 {
+		_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, "⏳ reading "+agentLabel(agent)+"'s history…", nil)
+	} else if m := gw.reply(thread, "⏳ reading "+agentLabel(agent)+"'s history…", nil); m != nil {
+		msgID = m.MessageID
+	}
+	guard("session browser", func() {
+		past, err := gw.fetchHistory(agent)
+		if err != nil {
+			gw.notify(thread, msgID, "⚠️ "+html.EscapeString(err.Error()), Rows(
+				[]Button{{Text: "⬅️ Back", CallbackData: "sessions"}}))
+			return
+		}
+		past = gw.withKept(agent, past)
+		if len(past) == 0 {
+			gw.notify(thread, msgID, agentLabel(agent)+" has no conversations on this server yet.", Rows(
+				[]Button{{Text: "✨ New session", CallbackData: "new"}},
+				[]Button{{Text: "⬅️ Back", CallbackData: "sessions"}}))
+			return
+		}
+		open := gw.openByRef()
+		var buttons []Button
+		for i, p := range past {
+			mark := "💬"
+			if p.Isolated {
+				mark = "🔒"
+			}
+			if p.Kept != "" {
+				mark = "📥"
+			}
+			if open[p.ID] != 0 {
+				mark = "▶️"
+			}
+			label := p.Preview
+			if p.Name != "" {
+				label = p.Name
+			}
+			buttons = append(buttons, Button{Text: mark + " " + truncate(label, 34), CallbackData: "past:" + strconv.Itoa(i)})
+		}
+		kb := Grid(1, buttons)
+		kb.InlineKeyboard = append(kb.InlineKeyboard, []Button{{Text: "⬅️ Back", CallbackData: "sessions"}})
+		text := "<b>" + agentLabel(agent) + "</b> — last " + strconv.Itoa(len(past)) + " conversations\n" +
+			"<i>▶️ open in a topic · 🔒 isolated</i>"
+		gw.rememberMenu(msgID, &pending{kind: "past", agent: agent, past: past, threadID: thread})
+		if e := gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, text, kb); e != nil {
+			logf("session browser: %v", e)
+		}
+	})
+}
+
+// withKept folds the archive into the list: a session whose topic was deleted
+// on purpose keeps the name it had, and one that never got as far as a
+// conversation still appears, because it was deliberately kept.
+func (gw *Gateway) withKept(agent string, past []PastSession) []PastSession {
+	kept := map[string]*Session{}
+	var orphans []*Session
+	for _, s := range gw.store.Kept() {
+		if s.Agent != agent {
+			continue
+		}
+		if s.Ref == "" {
+			orphans = append(orphans, s)
+			continue
+		}
+		kept[s.Ref] = s
+	}
+	for i := range past {
+		if s := kept[past[i].ID]; s != nil {
+			past[i].Kept = KeptID(s)
+			past[i].Name = s.Name
+			if past[i].Cwd == "" {
+				past[i].Cwd = s.Cwd
+			}
+		}
+	}
+	for _, s := range orphans {
+		past = append(past, PastSession{
+			ID: "", Preview: "(kept before it said anything)", Name: s.Name,
+			Cwd: s.Cwd, When: s.LastUsed.Format(time.RFC3339),
+			Isolated: s.Isolated, Kept: KeptID(s),
+		})
+	}
+	return past
+}
+
+// openByRef maps a conversation id to the topic that is running it.
+func (gw *Gateway) openByRef() map[string]int {
+	out := map[string]int{}
+	for _, s := range gw.store.List() {
+		if s.Ref != "" {
+			out[s.Ref] = s.ThreadID
+		}
+	}
+	return out
+}
+
+// showPastSession is the summary of one conversation, with the button that
+// takes it up again.
+func (gw *Gateway) showPastSession(thread, editMsg int, agent string, p PastSession, idx int) {
+	var b strings.Builder
+	b.WriteString("<b>" + agentLabel(agent) + "</b>")
+	if p.Name != "" {
+		b.WriteString(" · " + html.EscapeString(p.Name))
+	}
+	if p.Isolated {
+		b.WriteString(" · 🔒 isolated")
+	}
+	if p.Kept != "" {
+		b.WriteString(" · 📥 kept")
+	}
+	if p.ID != "" {
+		b.WriteString("\n<code>" + html.EscapeString(p.ID) + "</code>")
+	}
+	b.WriteString("\n\n")
+	b.WriteString("<i>" + html.EscapeString(truncate(p.Preview, 400)) + "</i>\n")
+	if p.Cwd != "" {
+		b.WriteString("\n📁 <code>" + html.EscapeString(p.Cwd) + "</code>")
+	}
+	if p.Messages > 0 {
+		fmt.Fprintf(&b, "\n💬 %d messages", p.Messages)
+	}
+	if when, err := time.Parse(time.RFC3339, p.When); err == nil {
+		b.WriteString(" · " + since(when))
+	}
+
+	rows := [][]Button{}
+	if topic := gw.openByRef()[p.ID]; topic != 0 {
+		b.WriteString("\n\n<i>this conversation is open in a topic</i>")
+		rows = append(rows, []Button{{Text: "➡️ Open the topic", URL: TopicLink(gw.cfg.ChatID, topic)}})
+	}
+	rows = append(rows,
+		[]Button{{Text: "▶️ Resume in a new topic", CallbackData: "past:go:" + strconv.Itoa(idx)}},
+		[]Button{{Text: "⬅️ Back", CallbackData: "sessions:" + agent}},
+	)
+	gw.notify(thread, editMsg, b.String(), Rows(rows...))
+}
+
+// resumePast gives a past conversation a topic of its own and points it at
+// the conversation, so the next message carries on where it left off.
+func (gw *Gateway) resumePast(thread, editMsg int, agent string, p PastSession) {
+	name := truncate(strings.TrimSuffix(p.Preview, "…"), 28)
+	if p.Name != "" {
+		name = p.Name
+	}
+	if name == "" || strings.HasPrefix(name, "(") {
+		name = "Resumed"
+	}
+	// A session that was kept when its topic went comes back as it was, with
+	// its model, its settings and, if it had one, its owner.
+	var restored *Session
+	if p.Kept != "" {
+		restored = gw.store.TakeKept(p.Kept)
+	}
+	var sess *Session
+	var err error
+	if p.Isolated {
+		// Its folder is still there; the sandbox is rebuilt around it.
+		dir := p.Cwd
+		if dir == "" || !within(gw.isolatedRoot(), dir) {
+			gw.notify(thread, editMsg, "That isolated session's folder is gone, so it cannot be resumed.")
+			return
+		}
+		sess, err = gw.createSessionIn(agent, dir, name, 0, true)
+	} else {
+		dir := p.Cwd
+		if dir == "" || !gw.cfg.PathAllowed(dir) {
+			dir = gw.cfg.DefaultCwd
+		}
+		if st, e := os.Stat(dir); e != nil || !st.IsDir() {
+			dir = gw.cfg.DefaultCwd
+		}
+		sess, err = gw.createSession(agent, dir, name, 0)
+	}
+	if err != nil {
+		if restored != nil {
+			// Put it back rather than losing it to a failed topic creation.
+			gw.store.PutKept(p.Kept, restored)
+		}
+		gw.notify(thread, editMsg, "⚠️ "+html.EscapeString(err.Error()))
+		return
+	}
+	ns := gw.store.Update(sess.ThreadID, func(s *Session) {
+		if restored != nil {
+			thread, title, cwd, root := s.ThreadID, s.Title, s.Cwd, s.Root
+			*s = *restored
+			s.ThreadID, s.Title, s.Cwd, s.Root = thread, title, cwd, root
+			s.DetachedAt = time.Time{}
+		}
+		s.Ref = p.ID
+		s.LastUsed = time.Now()
+	})
+	if ns == nil {
+		return
+	}
+	_ = gw.bridge.Send(gw.command("start", ns, ""))
+
+	gw.notify(thread, editMsg, "▶️ resumed <code>"+html.EscapeString(p.ID)+"</code> in a new topic.",
+		Rows([]Button{{Text: "➡️ Open the topic", URL: TopicLink(gw.cfg.ChatID, ns.ThreadID)}}))
+	header := gw.sessionHeader(ns) + "\n\n<i>continuing " + html.EscapeString(truncate(p.ID, 40)) +
+		"</i>\nSend a message and it picks up where that conversation stopped."
+	if m := gw.reply(ns.ThreadID, header, gw.sessionKeyboard(ns)); m != nil {
+		_ = gw.tg.Pin(gw.ctx, gw.cfg.ChatID, m.MessageID)
+	}
 }
 
 // cmdKill is the hard stop: it takes down the agent process for this topic
@@ -1021,8 +1436,12 @@ func (gw *Gateway) cmdStop(thread int) {
 }
 
 func (gw *Gateway) setCwd(thread int, sess *Session, arg string) {
-	p := resolvePath(sess.Cwd, arg)
-	if !gw.cfg.PathAllowed(p) {
+	p, err := hostPath(sess, sess.Cwd, arg)
+	if err != nil {
+		gw.reply(thread, "⚠️ "+html.EscapeString(err.Error()), nil)
+		return
+	}
+	if !gw.pathAllowed(sess, p) {
 		gw.reply(thread, "That path is outside the allowed roots.", nil)
 		return
 	}
@@ -1046,7 +1465,7 @@ func (gw *Gateway) setCwd(thread int, sess *Session, arg string) {
 	if ns.AutoName {
 		_ = gw.tg.EditTopic(gw.ctx, gw.cfg.ChatID, thread, ns.Title)
 	}
-	gw.reply(thread, "📁 now <code>"+html.EscapeString(p)+"</code>", gw.sessionKeyboard(ns))
+	gw.reply(thread, "📁 now <code>"+html.EscapeString(guestPath(ns, p))+"</code>", gw.sessionKeyboard(ns))
 }
 
 // finishPathEntry handles the text the user sends after "type a path".
@@ -1060,10 +1479,23 @@ func (gw *Gateway) finishPathEntry(p *pending, text string, thread int) {
 		}
 		gw.startSession(p.threadID, p.agent, dir, p.name, 0)
 	case "newname":
+		if p.isolated {
+			gw.startIsolated(p.threadID, p.agent, text, p.owner, 0)
+			return
+		}
 		if len(p.dirs) == 0 {
 			return
 		}
 		gw.startSession(p.threadID, p.agent, p.dirs[0], text, 0)
+	case "isoguest":
+		id, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(text, "@")), 10, 64)
+		if err != nil || id <= 0 {
+			gw.reply(p.threadID, "That is not a Telegram user id. It is a number — ask them to send <code>/id</code> here.", Rows(
+				[]Button{{Text: "🔒 Try again", CallbackData: "iso:guest"}, {Text: "Cancel", CallbackData: "dismiss"}},
+			))
+			return
+		}
+		gw.askTopicName(p.threadID, 0, p.agent, "sandbox", &pending{isolated: true, owner: id})
 	case "cd":
 		sess := gw.store.Get(p.threadID)
 		if sess == nil {
@@ -1097,13 +1529,17 @@ func (gw *Gateway) finishPathEntry(p *pending, text string, thread int) {
 // ---------------------------------------------------------------- callbacks
 
 func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
-	if cq.Message == nil || !gw.authorised(cq.From, cq.Message.Chat.ID) {
+	if cq.Message == nil {
 		_ = gw.tg.AnswerCallback(gw.ctx, cq.ID, "Not for you.", true)
 		return
 	}
 	thread := cq.Message.MessageThreadID
 	if !cq.Message.IsTopicMessage {
 		thread = 0
+	}
+	if !gw.authorised(cq.From, cq.Message.Chat.ID, thread) {
+		_ = gw.tg.AnswerCallback(gw.ctx, cq.ID, "Not for you.", true)
+		return
 	}
 	msgID := cq.Message.MessageID
 	data := cq.Data
@@ -1114,6 +1550,16 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 		head, arg = data[:i], data[i+1:]
 	}
 	sess := gw.store.Get(thread)
+
+	// The same rule as the commands: a guest may work in their topic, not run
+	// the gateway from it.
+	switch head {
+	case "new", "list", "end", "newdir", "newagent", "newname", "sessions", "past", "iso":
+		if !gw.mayList(cq.From.ID) {
+			ack("Only an administrator can do that.")
+			return
+		}
+	}
 
 	switch head {
 	case "dismiss":
@@ -1127,6 +1573,39 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 	case "list":
 		ack("")
 		gw.cmdSessions(thread)
+
+	case "sessions":
+		ack("")
+		switch {
+		case arg == "":
+			gw.cmdSessions(thread, msgID)
+		case arg == "live":
+			gw.showLiveTopics(thread, msgID)
+		default:
+			gw.showPastSessions(thread, msgID, arg)
+		}
+
+	case "past":
+		p := gw.menu(msgID)
+		if p == nil {
+			ack("That menu expired.")
+			return
+		}
+		resume := strings.HasPrefix(arg, "go:")
+		i, err := strconv.Atoi(strings.TrimPrefix(arg, "go:"))
+		if err != nil || i < 0 || i >= len(p.past) {
+			ack("")
+			return
+		}
+		if resume {
+			ack("Resuming")
+			gw.resumePast(thread, msgID, p.agent, p.past[i])
+			return
+		}
+		ack("")
+		// The list stays remembered: Back returns to it, and Resume needs it.
+		gw.rememberMenu(msgID, p)
+		gw.showPastSession(thread, msgID, p.agent, p.past[i], i)
 
 	case "new":
 		if arg == "" {
@@ -1162,7 +1641,7 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 				gw.startSession(p.threadID, p.agent, dir, p.name, msgID)
 			} else if sess != nil {
 				gw.setCwd(thread, sess, dir)
-				_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, "📁 <code>"+html.EscapeString(dir)+"</code>", nil)
+				_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, "📁 <code>"+html.EscapeString(guestPath(sess, dir))+"</code>", nil)
 			}
 		case "type":
 			ack("Send me the path")
@@ -1177,6 +1656,41 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 			ack("")
 			gw.showDirs(thread, p.dirs[i], head, p.agent, p.name, msgID)
 		}
+
+	case "iso":
+		p := gw.menu(msgID)
+		agent := ""
+		if p != nil {
+			agent = p.agent
+		}
+		if agent == "" {
+			agent = gw.defaultAgent()
+		}
+		switch arg {
+		case "start":
+			ack("")
+			gw.askWhoFor(thread, msgID, agent)
+		case "mine":
+			ack("")
+			gw.askTopicName(thread, msgID, agent, "sandbox", &pending{isolated: true})
+		case "guest":
+			ack("")
+			gw.askGuestID(thread, msgID, agent, cq.From.ID)
+		default:
+			ack("")
+		}
+
+	case "services":
+		if sess == nil {
+			ack("No session.")
+			return
+		}
+		if !sess.Isolated {
+			ack("Only isolated sessions run their own services.")
+			return
+		}
+		ack("")
+		go gw.runShell(thread, sess, sess.Cwd, "svc list")
 
 	case "skp":
 		p := gw.menu(msgID)
@@ -1217,17 +1731,24 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 
 	case "newname":
 		p := gw.menu(msgID)
-		if p == nil || len(p.dirs) == 0 {
+		if p == nil || (len(p.dirs) == 0 && !p.isolated) {
 			ack("That menu expired.")
 			return
 		}
 		if arg == "type" {
 			ack("Send me the name")
-			gw.awaitPath(cq.From.ID, &pending{kind: "newname", agent: p.agent, dirs: p.dirs, threadID: p.threadID})
+			gw.awaitPath(cq.From.ID, &pending{
+				kind: "newname", agent: p.agent, dirs: p.dirs, threadID: p.threadID,
+				isolated: p.isolated, owner: p.owner,
+			})
 			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, "Send the name for this topic as a message.", nil)
 			return
 		}
 		ack("")
+		if p.isolated {
+			gw.startIsolated(p.threadID, p.agent, "", p.owner, msgID)
+			return
+		}
 		gw.startSession(p.threadID, p.agent, p.dirs[0], "", msgID)
 
 	case "bind":
@@ -1493,9 +2014,27 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 			ack("No session.")
 			return
 		}
-		if arg != "close" && arg != "delete" {
+		if arg != "close" && arg != "delete" && arg != "keep" {
 			ack("")
 			gw.askEnd(thread)
+			return
+		}
+		if arg == "keep" {
+			// The topic goes, the conversation stays: it moves to the archive,
+			// where /sessions finds it and can give it a new topic. Startup
+			// must not resurrect it, which is why it leaves the live map.
+			ack("Kept")
+			_ = gw.bridge.Send(Command{Type: "stop", SID: sidOf(thread)})
+			kept := gw.store.Detach(thread)
+			if kept != nil && kept.Ref != "" {
+				logf("session %d detached, conversation %s kept", thread, kept.Ref)
+			}
+			if err := gw.tg.DeleteTopic(gw.ctx, gw.cfg.ChatID, thread); err != nil {
+				logf("delete topic %d: %v", thread, err)
+				_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID,
+					"📥 <i>session kept; the topic could not be deleted: "+html.EscapeString(err.Error())+"</i>", nil)
+				_ = gw.tg.CloseTopic(gw.ctx, gw.cfg.ChatID, thread)
+			}
 			return
 		}
 		ack("Ended")

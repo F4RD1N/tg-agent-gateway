@@ -39,6 +39,22 @@ rl.on('line', line => {
       out({ type: 'skills', sid: m.sid || '', agent, skills });
       break;
     }
+    case 'history': {
+      const agent = m.agent || 'claude';
+      const sessions = [];
+      for (let i = 0; i < (m.limit || 10); i++) {
+        sessions.push({
+          id: `${agent}-conv-${i}`,
+          preview: `something ${agent} was asked to do, number ${i}`,
+          cwd: m.roots && i === 1 ? `${m.roots[0]}/Claude/abc123` : '/tmp',
+          when: new Date(Date.now() - i * 3600e3).toISOString(),
+          messages: 4 + i,
+          isolated: i === 1,
+        });
+      }
+      out({ type: 'history', sid: m.sid || '', agent, sessions });
+      break;
+    }
     case 'start':
     case 'clear':
     case 'stop':

@@ -95,8 +95,10 @@ func cmdInit(path string, args []string) error {
 	token := fs.String("token", "", "bot token from @BotFather")
 	chat := fs.Int64("chat", 0, "forum supergroup id, e.g. -1001234567890")
 	users := fs.String("users", "", "comma separated Telegram user ids allowed to use the bot")
+	admins := fs.String("admins", "", "comma separated ids who may run the gateway (default: everyone allowed)")
 	cwd := fs.String("cwd", "/root", "default working directory")
 	roots := fs.String("roots", "/root", "comma separated roots sessions may work in")
+	isolated := fs.String("isolated", "", "where isolated sessions get their folders")
 	bridge := fs.String("bridge", "", "path to the node bridge (index.mjs)")
 	force := fs.Bool("force", false, "overwrite an existing config")
 	_ = fs.Parse(args)
@@ -119,6 +121,16 @@ func cmdInit(path string, args []string) error {
 			return fmt.Errorf("bad user id %q", u)
 		}
 		c.AllowedUserIDs = append(c.AllowedUserIDs, id)
+	}
+	for _, u := range splitList(*admins) {
+		id, err := strconv.ParseInt(u, 10, 64)
+		if err != nil {
+			return fmt.Errorf("bad admin id %q", u)
+		}
+		c.AdminUserIDs = append(c.AdminUserIDs, id)
+	}
+	if *isolated != "" {
+		c.IsolatedRoot = *isolated
 	}
 	if *bridge != "" {
 		c.BridgeCmd = []string{"node", *bridge}

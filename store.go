@@ -23,6 +23,17 @@ type Session struct {
 	Ref      string `json:"ref"` // the agent's own session/thread id, for resume
 	Verbose  bool   `json:"verbose"`
 
+	// Isolated means the session runs behind a sandbox: its own folder under
+	// the isolated root, no sight of this machine's files, memories or
+	// settings, and no way out of that folder. Root is that folder; Cwd may
+	// move about inside it.
+	Isolated bool   `json:"isolated,omitempty"`
+	Root     string `json:"root,omitempty"`
+	// OwnerID, when set, is the one Telegram user this session belongs to.
+	// Nobody else may use the topic - not the other allowed users, and not
+	// the admins either. It is how a sandbox is handed to somebody.
+	OwnerID int64 `json:"owner_id,omitempty"`
+
 	// Config, as offered by the Config button. Empty or zero means "leave the
 	// agent's own default alone", except PermMode, whose default is the
 	// full-access mode this gateway is built for.
@@ -41,19 +52,28 @@ type Session struct {
 	Turns    int       `json:"turns"`
 	Created  time.Time `json:"created"`
 	LastUsed time.Time `json:"last_used"`
+
+	// DetachedAt is set on a session whose topic was deleted while the
+	// conversation was deliberately kept. It lives in the archive from then
+	// on and can be resumed into a new topic.
+	DetachedAt time.Time `json:"detached_at,omitempty"`
 }
 
 type Store struct {
 	path string
 	mu   sync.Mutex
 	m    map[int]*Session
+	// kept holds sessions whose topic was deleted on purpose, keyed by the
+	// id of the topic they used to live in. They are not topics any more, so
+	// startup must not give them one.
+	kept map[string]*Session
 }
 
 func OpenStore(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	s := &Store{path: path, m: map[int]*Session{}}
+	s := &Store{path: path, m: map[int]*Session{}, kept: map[string]*Session{}}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -63,7 +83,8 @@ func OpenStore(path string) (*Store, error) {
 	}
 	if len(data) > 0 {
 		var wrapper struct {
-			Topics map[string]*Session `json:"topics"`
+			Topics   map[string]*Session `json:"topics"`
+			Detached map[string]*Session `json:"detached"`
 		}
 		if err := json.Unmarshal(data, &wrapper); err != nil {
 			return nil, err
@@ -76,16 +97,25 @@ func OpenStore(path string) (*Store, error) {
 				s.m[sess.ThreadID] = sess
 			}
 		}
+		for id, sess := range wrapper.Detached {
+			if sess != nil {
+				s.kept[id] = sess
+			}
+		}
 	}
 	return s, nil
 }
 
 func (s *Store) saveLocked() error {
 	wrapper := struct {
-		Topics map[string]*Session `json:"topics"`
-	}{Topics: map[string]*Session{}}
+		Topics   map[string]*Session `json:"topics"`
+		Detached map[string]*Session `json:"detached,omitempty"`
+	}{Topics: map[string]*Session{}, Detached: map[string]*Session{}}
 	for id, sess := range s.m {
 		wrapper.Topics[itoa(id)] = sess
+	}
+	for id, sess := range s.kept {
+		wrapper.Detached[id] = sess
 	}
 	data, err := json.MarshalIndent(wrapper, "", "  ")
 	if err != nil {
@@ -149,6 +179,68 @@ func (s *Store) List() []*Session {
 	sort.Slice(out, func(i, j int) bool { return out[i].LastUsed.After(out[j].LastUsed) })
 	return out
 }
+
+// Detach moves a session out of its topic and into the archive, so the topic
+// can be deleted while the conversation stays resumable. It returns the
+// archived copy, or nil if there was nothing in that topic.
+func (s *Store) Detach(threadID int) *Session {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess := s.m[threadID]
+	if sess == nil {
+		return nil
+	}
+	delete(s.m, threadID)
+	sess.DetachedAt = time.Now()
+	s.kept[itoa(threadID)] = sess
+	_ = s.saveLocked()
+	cp := *sess
+	return &cp
+}
+
+// Kept lists the sessions whose topics were deleted on purpose, newest first.
+func (s *Store) Kept() []*Session {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*Session, 0, len(s.kept))
+	for _, sess := range s.kept {
+		cp := *sess
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].DetachedAt.After(out[j].DetachedAt) })
+	return out
+}
+
+// TakeKept removes an archived session and returns it, for resuming into a
+// topic of its own.
+func (s *Store) TakeKept(id string) *Session {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess := s.kept[id]
+	if sess == nil {
+		return nil
+	}
+	delete(s.kept, id)
+	_ = s.saveLocked()
+	cp := *sess
+	return &cp
+}
+
+// PutKept returns a session to the archive, for when resuming it could not be
+// finished and losing it would be worse than leaving it where it was.
+func (s *Store) PutKept(id string, sess *Session) {
+	if sess == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := *sess
+	s.kept[id] = &cp
+	_ = s.saveLocked()
+}
+
+// KeptID is the archive key for a session: the topic it used to live in.
+func KeptID(sess *Session) string { return itoa(sess.ThreadID) }
 
 // RecentDirs lists the working directories in use, most recent first.
 func (s *Store) RecentDirs(limit int) []string {

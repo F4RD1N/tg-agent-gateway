@@ -69,7 +69,31 @@ does kill everything that session started.
   group-wide flood limit.
 - **It manages the topics.** It creates, renames, closes and deletes them,
   and on startup it gives every remembered session a topic again, recreating
-  any that were deleted while it was down.
+  any that were deleted while it was down. **Delete a topic but keep the
+  session** and the conversation goes to the archive instead: `/sessions`
+  finds it later and gives it a new topic where it carries on.
+- **A session browser.** `/sessions` in General lists the agents; pick one and
+  it shows that agent's last ten conversations, read from where the agent
+  itself keeps them - so conversations that were never started here are
+  listed too. Open one for a summary (what it was about, its id, its folder,
+  how long ago) and a button that resumes it in a new topic.
+- **Isolated sessions.** Instead of picking a folder, pick **Isolated
+  sandbox**: the session gets a folder of its own under `/root/isolated` and
+  sees nothing else of the machine. No other projects, no memories, no
+  settings, no other session's history, and none of `/etc` that holds
+  secrets - not this bot's own token, the panel database, the TLS keys or the
+  password file. What it does have is a real machine: shell, compilers,
+  package tools, the network, and root inside its own namespace. It cannot
+  mount a disk, load a module, see another process or touch the services
+  running outside. The bot asks who the sandbox is for; answer *someone else*
+  and give their Telegram id, and that topic answers only them - the admins
+  included.
+- **Services instead of systemd.** There is no init inside a sandbox, so a
+  website started from a chat message would die with the turn. `svc` is the
+  stand-in: `svc start web npm run dev`, then `svc list`, `svc log web`,
+  `svc stop web`. A service keeps running between messages, comes back if the
+  session restarts, and the port it opens is reachable from outside. `/services`
+  shows what is running.
 - **Anything you send, with the caption as the prompt.** Photos, documents,
   video, audio, voice notes, animations, stickers - all of them land in the
   session's folder and the caption becomes the instruction. A picture is
@@ -94,8 +118,9 @@ unzip tg-agent-gateway_source_*.zip -d tg-agent-gateway && cd tg-agent-gateway
 sudo ./installer.sh
 ```
 
-It will ask for the token, the group, who may use it and which folders it may
-work in. To skip the questions, pass them instead:
+It will ask for the token, the group, who may use it, which of those run it,
+and which folders it may work in. It installs bubblewrap if it is missing, so
+isolated sessions work out of the box. To skip the questions, pass them instead:
 
 ```bash
 sudo ./installer.sh --token <bot token> --chat -1001234567890 --users <your user id>
@@ -106,6 +131,8 @@ Go if they are missing, builds the binary, installs the bridge with its SDKs,
 writes `/etc/tg-agent-gateway/config.json`, installs the service and starts it.
 
 Other options: `--cwd` (default folder), `--roots` (folders sessions may use),
+`--admins` (who may browse and start sessions), `--isolated` (where sandboxes
+live),
 `--import-old <gateway.db>` (take over sessions from the older Python
 gateway), `--no-start`, `--uninstall [--purge]`.
 
@@ -118,7 +145,7 @@ In **General**:
 | `/new` | pick agent and folder with buttons |
 | `/new My Project` | same, with that topic name |
 | `/new codex /root/app` | skip straight to a session |
-| `/sessions` | list them, with a button that opens each topic |
+| `/sessions` | browse past conversations and resume one |
 | `/help` `/id` | |
 
 In a **topic**:
@@ -139,7 +166,8 @@ In a **topic**:
 | `/session` `/resume <id>` | show, or take over, a conversation id |
 | `/compact` | compact the agent's context |
 | `/rename <name>` | rename the topic |
-| `/end` | close or delete the topic |
+| `/end` | close the topic, or delete it and keep the session |
+| `/services` | what an isolated session keeps running |
 | `/verbose` | show tool output and thinking |
 | `/status` | what this session is, with its buttons |
 
@@ -156,6 +184,8 @@ own commands work too.
 | `bot_token` | from BotFather; treat it as root on this machine |
 | `chat_id` | the forum supergroup |
 | `allowed_user_ids` | who may use it; everyone else is ignored silently |
+| `admin_user_ids` | of those, who may browse and start sessions (default: all of them) |
+| `isolated_root` | where sandboxed sessions get their folders (`/root/isolated`) |
 | `default_cwd` | folder offered for new sessions |
 | `workspace_roots` | sessions and file transfers may not leave these |
 | `state_path` | remembered sessions (`/var/lib/tg-agent-gateway/state.json`) |
@@ -183,6 +213,28 @@ prompt never becomes a shell string: it travels to the agent over stdin as
 JSON. `/run` is the one deliberate shell path, and it is confined to the
 session's folder.
 
+**Isolated sessions** are how somebody else gets an agent here without
+getting the machine. The whole session - the agent, the shell it runs, every
+command those start - lives inside a bubblewrap sandbox whose only writable
+place is the session's own folder, mounted at `/workspace`. `/root` does not
+exist in there, `/etc` is rebuilt from the handful of files that programs
+need, and the process, IPC and hostname namespaces are its own. `/run`,
+`/get`, `/ls` and `/cd` in such a topic are confined to that folder too, and
+the sandbox is never handed the bot token: files come back through the
+session's outbox, which the gateway posts into the topic. A session made for
+somebody else answers that Telegram id and nobody else.
+
+Two things it deliberately keeps: the network, and each agent's own login
+credential, without which no agent can run at all. So an isolated session can
+reach the internet and spend that account's quota. It is a boundary against
+reading this server, not a captive box.
+
+**What Telegram cannot do:** hide a topic from a group member. Everyone in
+the group sees every topic in the list. The bot enforces who may *act* -
+guests only in their own topic, `/sessions` and `/new` only for admins - but
+the titles are visible to all. Keep genuinely separate work in a separate
+group.
+
 ## Development
 
 ```bash
@@ -205,6 +257,9 @@ buttons, and a message that carries buttons is padded to a minimum width, or
 Telegram shrinks the bubble and clips the labels.
 
 Layout: `main.go` (CLI), `gateway.go` (routing, sessions, streaming),
+`sandbox.go` (isolated sessions and their path boundary), `outbox.go`
+(delivery out of a sandbox), `tools/sandbox-run` (the sandbox itself),
+`tools/svc` (services inside one), `bridge/history.mjs` (past conversations),
 `steps.go` (tool calls to human phrases), `tools/tg-send` (delivery into a
 topic),
 `handlers.go` (commands and buttons), `telegram.go` (Bot API, keyboard

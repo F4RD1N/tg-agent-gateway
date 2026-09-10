@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""svc - keep something running inside an isolated session.
+
+There is no systemd in here, and a command started from a chat message would
+die with the turn that started it. svc is the small stand-in: it starts a
+program in its own session, writes down what it was and where its log is, and
+brings it back when the sandbox is rebuilt.
+
+    svc start web npm run dev        start "web" and leave it running
+    svc list                         what is running, and on which port
+    svc log web                      the last of a service's output
+    svc stop web                     stop it
+    svc restart web                  stop it and start it again
+    svc rm web                       stop it and forget it
+    svc resume                       start everything again (done for you)
+
+State lives in .services/ inside the session folder, so it survives a restart
+and goes away with the session.
+"""
+import argparse
+import json
+import os
+import pathlib
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+ROOT = pathlib.Path(os.environ.get("AGENT_SERVICES", "/workspace/.services"))
+LOG_TAIL = 4000
+
+
+def unit_dir(name):
+    if not name or "/" in name or name.startswith("."):
+        sys.exit(f"bad service name: {name!r}")
+    return ROOT / name
+
+
+def read(path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    return True
+
+
+def units():
+    if not ROOT.is_dir():
+        return []
+    out = []
+    for d in sorted(ROOT.iterdir()):
+        unit = read(d / "unit.json")
+        if unit:
+            unit["name"] = d.name
+            out.append(unit)
+    return out
+
+
+def status(unit):
+    pid = read(unit_dir(unit["name"]) / "pid.json", {}) or {}
+    running = alive(pid.get("pid"))
+    return pid.get("pid") if running else None
+
+
+def spawn(name, command, cwd):
+    d = unit_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    log = d / "log"
+    handle = open(log, "ab")
+    handle.write(f"\n--- started {time.strftime('%Y-%m-%d %H:%M:%S')}: {' '.join(command)}\n".encode())
+    handle.flush()
+    # Its own session and process group, so it outlives the turn that started
+    # it and can be stopped as a group later.
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=handle,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    (d / "pid.json").write_text(json.dumps({"pid": proc.pid, "at": time.time()}))
+    return proc.pid
+
+
+def cmd_start(a):
+    if not a.command:
+        sys.exit("give a command: svc start <name> <command...>")
+    d = unit_dir(a.name)
+    unit = read(d / "unit.json") or {}
+    if status({"name": a.name}):
+        print(json.dumps({"ok": True, "name": a.name, "already": True}))
+        return
+    cwd = a.cwd or unit.get("cwd") or os.getcwd()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "unit.json").write_text(json.dumps({"command": a.command, "cwd": cwd, "enabled": True}))
+    pid = spawn(a.name, a.command, cwd)
+    print(json.dumps({"ok": True, "name": a.name, "pid": pid, "log": str(d / "log")}))
+
+
+def stop_unit(name, forget=False):
+    d = unit_dir(name)
+    pid = (read(d / "pid.json", {}) or {}).get("pid")
+    if alive(pid):
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        for _ in range(30):
+            if not alive(pid):
+                break
+            time.sleep(0.1)
+        if alive(pid):
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except OSError:
+                pass
+    (d / "pid.json").unlink(missing_ok=True)
+    unit = read(d / "unit.json")
+    if unit and not forget:
+        unit["enabled"] = False
+        (d / "unit.json").write_text(json.dumps(unit))
+    if forget:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def cmd_stop(a):
+    stop_unit(a.name)
+    print(json.dumps({"ok": True, "name": a.name, "stopped": True}))
+
+
+def cmd_rm(a):
+    stop_unit(a.name, forget=True)
+    print(json.dumps({"ok": True, "name": a.name, "removed": True}))
+
+
+def cmd_restart(a):
+    d = unit_dir(a.name)
+    unit = read(d / "unit.json")
+    if not unit:
+        sys.exit(f"no such service: {a.name}")
+    stop_unit(a.name)
+    unit["enabled"] = True
+    (d / "unit.json").write_text(json.dumps(unit))
+    pid = spawn(a.name, unit["command"], unit.get("cwd") or os.getcwd())
+    print(json.dumps({"ok": True, "name": a.name, "pid": pid}))
+
+
+def cmd_list(a):
+    rows = []
+    for unit in units():
+        pid = status(unit)
+        rows.append({
+            "name": unit["name"],
+            "running": bool(pid),
+            "pid": pid,
+            "command": " ".join(unit.get("command", [])),
+            "cwd": unit.get("cwd", ""),
+            "enabled": bool(unit.get("enabled")),
+        })
+    if a.json:
+        print(json.dumps(rows, indent=1))
+        return
+    if not rows:
+        print("no services")
+        return
+    for r in rows:
+        state = f"running (pid {r['pid']})" if r["running"] else "stopped"
+        print(f"{r['name']:<16} {state:<22} {r['command']}")
+
+
+def cmd_log(a):
+    log = unit_dir(a.name) / "log"
+    if not log.exists():
+        sys.exit(f"no log for {a.name}")
+    data = log.read_bytes()
+    sys.stdout.write(data[-a.bytes:].decode("utf8", "replace"))
+
+
+def cmd_resume(a):
+    started = []
+    for unit in units():
+        if not unit.get("enabled") or status(unit):
+            continue
+        try:
+            spawn(unit["name"], unit["command"], unit.get("cwd") or "/workspace")
+            started.append(unit["name"])
+        except Exception as e:  # a service whose command has gone
+            print(f"{unit['name']}: {e}", file=sys.stderr)
+    if not a.quiet:
+        print(json.dumps({"ok": True, "resumed": started}))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="keep something running in this session")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("start", help="start a service and leave it running")
+    s.add_argument("name")
+    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.add_argument("--cwd", default="")
+    s.set_defaults(fn=cmd_start)
+
+    for name, fn, help_ in (("stop", cmd_stop, "stop it"), ("rm", cmd_rm, "stop it and forget it"),
+                            ("restart", cmd_restart, "stop and start it")):
+        s = sub.add_parser(name, help=help_)
+        s.add_argument("name")
+        s.set_defaults(fn=fn)
+
+    s = sub.add_parser("list", help="what is running")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("log", help="the last of a service's output")
+    s.add_argument("name")
+    s.add_argument("--bytes", type=int, default=LOG_TAIL)
+    s.set_defaults(fn=cmd_log)
+
+    s = sub.add_parser("resume", help="start everything that should be running")
+    s.add_argument("--quiet", action="store_true")
+    s.set_defaults(fn=cmd_resume)
+
+    a = ap.parse_args()
+    # "svc start web -- npm run dev" and "svc start web npm run dev" both work.
+    if getattr(a, "command", None) and a.command and a.command[0] == "--":
+        a.command = a.command[1:]
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

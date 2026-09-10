@@ -20,6 +20,9 @@ import (
 type sentCall struct {
 	Method string
 	Params map[string]any
+	// ID is the message id the fake handed back, so a test can press the
+	// buttons on the message it just watched go out.
+	ID int
 }
 
 type fakeTG struct {
@@ -41,9 +44,9 @@ func newFakeTG(t *testing.T) *fakeTG {
 			_ = json.Unmarshal(body, &params)
 		}
 		f.mu.Lock()
-		f.calls = append(f.calls, sentCall{Method: method, Params: params})
 		f.nextID++
 		id := f.nextID
+		f.calls = append(f.calls, sentCall{Method: method, Params: params, ID: id})
 		f.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")

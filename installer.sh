@@ -18,6 +18,7 @@ ROOTS="${WORKSPACE_ROOTS:-}"
 ROOTS_GIVEN=0
 [ -n "$ROOTS" ] && ROOTS_GIVEN=1
 NO_START=0
+ADMINS="${ADMINS:-}"
 UNINSTALL=0
 PURGE=0
 IMPORT_OLD="${IMPORT_OLD:-}"
@@ -28,6 +29,7 @@ APPDIR="${APPDIR:-/opt/tg-agent-gateway}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/tg-agent-gateway}"
 CONFIG="$CONFIG_DIR/config.json"
 DATA_DIR="${DATA_DIR:-/var/lib/tg-agent-gateway}"
+ISOLATED="${ISOLATED:-/root/isolated}"
 UNIT="${UNIT:-/etc/systemd/system/tg-agent-gateway.service}"
 GO_MIN=1.24
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,6 +41,8 @@ while [ $# -gt 0 ]; do
     --users) USERS="$2"; shift 2 ;;
     --cwd) CWD="$2"; shift 2 ;;
     --roots) ROOTS="$2"; ROOTS_GIVEN=1; shift 2 ;;
+    --admins) ADMINS="$2"; shift 2 ;;
+    --isolated) ISOLATED="$2"; shift 2 ;;
     --import-old) IMPORT_OLD="$2"; shift 2 ;;
     --no-start) NO_START=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
@@ -57,6 +61,11 @@ if [ "$UNINSTALL" -eq 1 ]; then
   systemctl disable --now tg-agent-gateway 2>/dev/null || true
   rm -f "$UNIT"; systemctl daemon-reload
   rm -f "$BIN" /usr/local/bin/tg-send; rm -rf "$APPDIR"
+  # The isolated sessions' folders are somebody's work, so they stay: say
+  # where they are rather than deleting them behind their back.
+  if [ -d "$ISOLATED" ]; then
+    log "isolated session folders kept in $ISOLATED (delete them yourself if you want them gone)"
+  fi
   if [ "$PURGE" -eq 1 ]; then rm -rf "$CONFIG_DIR" "$DATA_DIR"; log "config and state removed"; fi
   log "uninstalled"
   exit 0
@@ -110,14 +119,41 @@ log "installed $BIN ($VERSION)"
 
 log "installing the agent bridge"
 mkdir -p "$APPDIR/bridge"
-install -m 0644 "$SRC/bridge/index.mjs" "$APPDIR/bridge/index.mjs"
-install -m 0644 "$SRC/bridge/worker.mjs" "$APPDIR/bridge/worker.mjs"
+for f in index.mjs worker.mjs history.mjs; do
+  install -m 0644 "$SRC/bridge/$f" "$APPDIR/bridge/$f"
+done
 install -m 0644 "$SRC/bridge/package.json" "$APPDIR/bridge/package.json"
 [ -f "$SRC/bridge/package-lock.json" ] && install -m 0644 "$SRC/bridge/package-lock.json" "$APPDIR/bridge/package-lock.json"
 ( cd "$APPDIR/bridge" && npm install --omit=dev --no-fund --no-audit --silent )
 
 # tg-send: how an agent delivers a file into its own topic.
 install -m 0755 "$SRC/tools/tg-send" /usr/local/bin/tg-send
+
+# The helpers an isolated session is built out of: the sandbox itself, the
+# service manager that stands in for systemd inside it, and the tg-send that
+# hands files back through the outbox instead of holding the bot token.
+mkdir -p "$APPDIR/tools"
+install -m 0755 "$SRC/tools/sandbox-run" "$APPDIR/tools/sandbox-run"
+install -m 0755 "$SRC/tools/svc" "$APPDIR/tools/svc"
+install -m 0755 "$SRC/tools/tg-send-outbox" "$APPDIR/tools/tg-send-outbox"
+
+# bubblewrap is what makes an isolated session isolated. Without it the bot
+# still works; it just cannot offer sandboxes.
+if ! command -v bwrap >/dev/null 2>&1; then
+  log "installing bubblewrap (for isolated sessions)"
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y bubblewrap >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y bubblewrap >/dev/null 2>&1 || true
+  fi
+fi
+if command -v bwrap >/dev/null 2>&1; then
+  mkdir -p "$ISOLATED/Claude" "$ISOLATED/Codex" "$ISOLATED/Antigravity"
+  chmod 700 "$ISOLATED"
+  log "isolated sessions will live in $ISOLATED"
+else
+  warn "bubblewrap is not installed: isolated sessions will not be offered"
+fi
 
 # ---------------------------------------------------------------- config
 
@@ -264,6 +300,15 @@ if [ ! -f "$CONFIG" ]; then
       ROOTS=""
     fi
     ask ROOTS "Folders sessions may work in, comma separated" "${ROOTS:-$CWD}"
+    # Who runs the gateway, as opposed to who merely gets answered. Anyone
+    # left out becomes a guest: they can only use an isolated session that
+    # was made for them, and nothing else in the group.
+    if [ -z "$ADMINS" ]; then
+      ask ADMINS "Of those, who may browse and start sessions (Enter = all of them)" ""
+      case "$ADMINS" in
+        *[!0-9,\ ]*) warn "user ids are numbers; treating everyone as an administrator"; ADMINS="" ;;
+      esac
+    fi
     check_admin
   else
     [ -n "$TOKEN" ] || die "no config and no terminal: pass --token, --chat and --users"
@@ -272,15 +317,18 @@ if [ ! -f "$CONFIG" ]; then
   fi
   [ -n "$ROOTS" ] || ROOTS="$CWD"
   "$BIN" -config "$CONFIG" init -token "$TOKEN" -chat "$CHAT" -users "$USERS" \
-      -cwd "$CWD" -roots "$ROOTS" -bridge "$APPDIR/bridge/index.mjs"
+      -admins "$ADMINS" -cwd "$CWD" -roots "$ROOTS" -isolated "$ISOLATED" \
+      -bridge "$APPDIR/bridge/index.mjs"
   log "wrote $CONFIG"
 else
   log "keeping existing $CONFIG"
-  python3 - "$CONFIG" "$APPDIR/bridge/index.mjs" <<'PY'
+  python3 - "$CONFIG" "$APPDIR/bridge/index.mjs" "$ISOLATED" <<'PY'
 import json, sys
 path, bridge = sys.argv[1], sys.argv[2]
 cfg = json.load(open(path))
 cfg["bridge_cmd"] = ["node", bridge]
+# An install that predates isolated sessions gets the default place for them.
+cfg.setdefault("isolated_root", sys.argv[3])
 json.dump(cfg, open(path, "w"), indent=2)
 PY
 fi

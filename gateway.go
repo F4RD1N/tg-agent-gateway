@@ -33,15 +33,18 @@ func guard(what string, fn func()) {
 // pending remembers what a menu message is offering, so a button press can
 // carry a short index instead of a long path.
 type pending struct {
-	kind     string // newagent | newdir | cd | model
+	kind     string // newagent | newdir | cd | model | owner | past
 	agent    string
 	name     string // topic name the user asked for with "/new Name"
 	dirs     []string
 	models   []ModelInfo
 	skills   []SkillInfo
+	past     []PastSession
 	page     int
 	modelIdx int
 	threadID int
+	isolated bool  // this session is being created behind a sandbox
+	owner    int64 // the one person the session belongs to, if it is for somebody else
 	expires  time.Time
 }
 
@@ -113,7 +116,7 @@ func sidOf(threadID int) string { return strconv.Itoa(threadID) }
 // command builds a bridge command carrying everything the Config button can
 // change, so a setting takes effect on the very next turn.
 func (gw *Gateway) command(kind string, sess *Session, text string) Command {
-	return Command{
+	c := Command{
 		Type: kind, SID: sidOf(sess.ThreadID), Agent: sess.Agent, Cwd: sess.Cwd,
 		Model: sess.Model, Effort: sess.Effort, Resume: sess.Ref, Text: text,
 		PermMode: sess.PermMode, Thinking: sess.Thinking, MaxTurns: sess.MaxTurns,
@@ -125,6 +128,16 @@ func (gw *Gateway) command(kind string, sess *Session, text string) Command {
 		TGToken: gw.cfg.BotToken,
 		TGTitle: sess.Title,
 	}
+	if sess.Isolated {
+		// The agent works in /workspace and knows nothing of the path this
+		// machine keeps the folder at. The bot token stays out here: whoever
+		// works in an isolated topic would otherwise be able to drive the
+		// whole bot. Files come back through the session's outbox instead.
+		c.SandboxDir = sandboxRoot(sess)
+		c.Cwd = guestPath(sess, sess.Cwd)
+		c.TGToken, c.TGChat = "", ""
+	}
+	return c
 }
 
 // editInterval widens as more topics stream at once: Telegram counts every
@@ -213,11 +226,32 @@ func (gw *Gateway) handleUpdate(u TGUpdate) {
 	}
 }
 
-func (gw *Gateway) authorised(user *TGUser, chatID int64) bool {
-	if user == nil || !gw.cfg.UserAllowed(user.ID) {
+// authorised decides whether this person may act here at all.
+//
+// Two kinds of person use the bot. An admin runs it and may work in any
+// topic. A guest was given one isolated session and exists only in that
+// topic: they are not in the allowed list, their id is on the session, and
+// everywhere else the bot does not answer them.
+func (gw *Gateway) authorised(user *TGUser, chatID int64, thread int) bool {
+	if user == nil || chatID != gw.cfg.ChatID {
 		return false
 	}
-	return chatID == gw.cfg.ChatID
+	sess := gw.store.Get(thread)
+	if sess != nil && sess.OwnerID != 0 {
+		// A session with an owner is that person's alone, admins included.
+		// It is the whole point of handing somebody a sandbox.
+		return user.ID == sess.OwnerID
+	}
+	return gw.cfg.UserAllowed(user.ID)
+}
+
+// mayList reports whether this person may see or start sessions. Guests may
+// not: they get the one topic they were given.
+func (gw *Gateway) mayList(userID int64) bool { return gw.cfg.IsAdmin(userID) }
+
+// adminOnly answers a guest who reached for a control that is not theirs.
+func (gw *Gateway) adminOnly(thread int) {
+	gw.reply(thread, "Only an administrator of this gateway can do that.", nil)
 }
 
 // ---------------------------------------------------------------- messages
@@ -226,7 +260,11 @@ func (gw *Gateway) handleMessage(m *TGMessage) {
 	if m.From != nil && m.From.IsBot {
 		return
 	}
-	if !gw.authorised(m.From, m.Chat.ID) {
+	messageThread := m.MessageThreadID
+	if !m.IsTopicMessage {
+		messageThread = 0
+	}
+	if !gw.authorised(m.From, m.Chat.ID, messageThread) {
 		if m.From != nil && m.Text == "/id" {
 			// The one thing an unknown chat may learn: its own ids, so the
 			// operator can put them in the config.
@@ -235,10 +273,7 @@ func (gw *Gateway) handleMessage(m *TGMessage) {
 		}
 		return
 	}
-	thread := m.MessageThreadID
-	if !m.IsTopicMessage {
-		thread = 0 // General
-	}
+	thread := messageThread // 0 is General
 
 	// A path we asked the user to type.
 	if p := gw.takeAwaited(m.From.ID); p != nil && m.Text != "" && !strings.HasPrefix(m.Text, "/") {
@@ -310,6 +345,9 @@ func (gw *Gateway) reply(thread int, text string, kb *Keyboard) *TGMessage {
 func (gw *Gateway) submitWithFiles(sess *Session, caption string, paths []string) {
 	var images, others []string
 	for _, p := range paths {
+		// An isolated agent knows the file by the path it can see, which is
+		// under /workspace, not the one this machine keeps it at.
+		p = guestPath(sess, p)
 		if isImage(p) {
 			images = append(images, p)
 		} else {
@@ -378,11 +416,17 @@ func (gw *Gateway) submitPrompt(sess *Session, text string, images []string) {
 // agent knows where its files belong. Without it, both CLIs fall back to the
 // private-chat delivery helpers their own notes tell them to use.
 func sessionPreamble(sess *Session) string {
-	return "[gateway] You are answering inside a Telegram topic. " +
+	s := "[gateway] You are answering inside a Telegram topic. " +
 		"To send the user a file, an archive or a build, run `tg-send <path>` " +
 		"(optionally with --caption \"...\"); it delivers into this topic. " +
 		"Do not use any other Telegram script, chat id or bot token. " +
-		"Keep your replies short and readable: they are being read on a phone.\n\n"
+		"Keep your replies short and readable: they are being read on a phone."
+	if sess != nil && sess.Isolated {
+		s += " This session is isolated: /workspace is yours and is the only " +
+			"folder that exists, the rest of the machine is not visible, and " +
+			"`tg-send` hands the file to the gateway to post."
+	}
+	return s + "\n\n"
 }
 
 func (gw *Gateway) pump(sess *Session, turn *Turn, text string, images []string) {
@@ -393,6 +437,8 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string, images []string)
 		gw.mu.Lock()
 		delete(gw.running, sess.ThreadID)
 		gw.mu.Unlock()
+		// Whatever the turn left for delivery goes out now, however it ended.
+		gw.drainOutbox(sess)
 	}()
 
 	gw.tg.TypingAction(gw.ctx, gw.cfg.ChatID, sess.ThreadID)
@@ -430,6 +476,10 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string, images []string)
 			typingBeat++
 			if typingBeat%3 == 0 {
 				gw.tg.TypingAction(gw.ctx, gw.cfg.ChatID, sess.ThreadID)
+				// An isolated session delivers by leaving files in its
+				// outbox, so a build that finished mid-turn arrives about
+				// when the agent says it made one.
+				gw.drainOutbox(sess)
 			}
 		case <-idle.C:
 			turn.AddNote("⚠️ no response for 45 minutes, giving up")
@@ -591,10 +641,19 @@ func bareName(title string) string {
 }
 
 func (gw *Gateway) createSession(agent, cwd, name string, thread int) (*Session, error) {
+	return gw.createSessionIn(agent, cwd, name, thread, false)
+}
+
+// createSessionIn makes a session, isolated or not. An isolated one gets a
+// folder of its own under the isolated root and is never asked where to work.
+func (gw *Gateway) createSessionIn(agent, cwd, name string, thread int, isolated bool) (*Session, error) {
 	name = strings.TrimSpace(name)
 	auto := name == ""
 	if auto {
 		name = filepath.Base(strings.TrimRight(cwd, "/"))
+		if isolated {
+			name = "Sandbox " + name
+		}
 	}
 	title := topicTitle(agent, name)
 	if thread == 0 {
@@ -609,8 +668,12 @@ func (gw *Gateway) createSession(agent, cwd, name string, thread int) (*Session,
 		Agent: agent, Cwd: cwd,
 		Created: time.Now(), LastUsed: time.Now(),
 	}
+	if isolated {
+		sess.Isolated = true
+		sess.Root = cwd
+	}
 	gw.store.Put(sess)
-	_ = gw.bridge.Send(Command{Type: "start", SID: sidOf(thread), Agent: agent, Cwd: cwd})
+	_ = gw.bridge.Send(gw.command("start", sess, ""))
 	return sess, nil
 }
 
@@ -619,7 +682,14 @@ func (gw *Gateway) sessionHeader(sess *Session) string {
 	if model == "" {
 		model = "default"
 	}
-	s := fmt.Sprintf("<b>%s</b>\n📁 <code>%s</code>\n🧠 %s", agentLabel(sess.Agent), html.EscapeString(sess.Cwd), html.EscapeString(model))
+	name := agentLabel(sess.Agent)
+	if sess.Isolated {
+		name = "🔒 " + name + " <i>(isolated)</i>"
+	}
+	s := fmt.Sprintf("<b>%s</b>\n📁 <code>%s</code>\n🧠 %s", name, html.EscapeString(guestPath(sess, sess.Cwd)), html.EscapeString(model))
+	if sess.OwnerID != 0 {
+		s += fmt.Sprintf("\n👤 <code>%d</code> only", sess.OwnerID)
+	}
 	if sess.Effort != "" {
 		s += " · ⚡" + html.EscapeString(sess.Effort)
 	}
@@ -640,14 +710,24 @@ func (gw *Gateway) sessionHeader(sess *Session) string {
 }
 
 func (gw *Gateway) sessionKeyboard(sess *Session) *Keyboard {
-	return Rows(
-		[]Button{{Text: "🧠 Model", CallbackData: "model"}, {Text: "⚡ Effort", CallbackData: "effort"}},
-		[]Button{{Text: "📁 Folder", CallbackData: "cd"}, {Text: "🤖 Agent", CallbackData: "agent"}},
-		[]Button{{Text: "🧩 Skills", CallbackData: "skills"}, {Text: "⚙️ Config", CallbackData: "cfg"}},
-		[]Button{{Text: "🔎 Details: " + onOff(sess.Verbose), CallbackData: "verbose"}, {Text: "🔓 Mode", CallbackData: "cfg:perm"}},
+	rows := [][]Button{
+		{{Text: "🧠 Model", CallbackData: "model"}, {Text: "⚡ Effort", CallbackData: "effort"}},
+		{{Text: "📁 Folder", CallbackData: "cd"}, {Text: "🤖 Agent", CallbackData: "agent"}},
+		{{Text: "🧩 Skills", CallbackData: "skills"}, {Text: "⚙️ Config", CallbackData: "cfg"}},
+		{{Text: "🔎 Details: " + onOff(sess.Verbose), CallbackData: "verbose"}, {Text: "🔓 Mode", CallbackData: "cfg:perm"}},
+	}
+	if sess.Isolated {
+		// There is no systemd inside a sandbox, so what is running there is
+		// worth a button of its own.
+		rows = append(rows, []Button{{Text: "🛠 Services", CallbackData: "services"}, {Text: "🧹 New thread", CallbackData: "clear"}})
+		rows = append(rows, []Button{{Text: "💀 Kill processes", CallbackData: "kill"}, {Text: "🗑 End session", CallbackData: "end"}})
+		return Rows(rows...)
+	}
+	rows = append(rows,
 		[]Button{{Text: "🧹 New thread", CallbackData: "clear"}, {Text: "💀 Kill processes", CallbackData: "kill"}},
 		[]Button{{Text: "🗑 End session", CallbackData: "end"}},
 	)
+	return Rows(rows...)
 }
 
 func onOff(b bool) string {
@@ -870,11 +950,16 @@ func (gw *Gateway) flushAlbum(groupID string) {
 
 // ---------------------------------------------------------------- shell
 
-func (gw *Gateway) runShell(thread int, cwd, cmdline string) {
+func (gw *Gateway) runShell(thread int, sess *Session, cwd, cmdline string) {
 	ctx, cancel := context.WithTimeout(gw.ctx, 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", "-lc", cmdline)
-	cmd.Dir = cwd
+	name, argv, dir, err := sandboxCommand(sess, cwd, cmdline)
+	if err != nil {
+		gw.reply(thread, "⚠️ "+html.EscapeString(err.Error()), nil)
+		return
+	}
+	cmd := exec.CommandContext(ctx, name, argv...)
+	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	body := strings.TrimRight(string(out), "\n")
 	status := "✓"
@@ -1119,6 +1204,42 @@ func (gw *Gateway) fetchSkills(agent string) ([]SkillInfo, error) {
 	}
 }
 
+// fetchHistory asks for the conversations this agent still has on disk. It is
+// read fresh every time: somebody browsing their sessions has just been
+// working in one of them.
+func (gw *Gateway) fetchHistory(agent string) ([]PastSession, error) {
+	gw.mu.Lock()
+	gw.reqSeq++
+	sid := "history-" + agent + "-" + strconv.FormatInt(gw.reqSeq, 10)
+	gw.mu.Unlock()
+
+	ch := gw.bridge.Subscribe(sid)
+	defer gw.bridge.Unsubscribe(sid, ch)
+	cmd := Command{Type: "history", SID: sid, Agent: agent, Limit: pastPerAgent}
+	if root := gw.isolatedRoot(); root != "" {
+		cmd.Roots = []string{root}
+	}
+	if err := gw.bridge.Send(cmd); err != nil {
+		return nil, err
+	}
+	deadline := time.After(60 * time.Second)
+	for {
+		select {
+		case ev := <-ch:
+			switch ev.Type {
+			case "history":
+				return append([]PastSession(nil), ev.Sessions...), nil
+			case "error":
+				return nil, fmt.Errorf("%s", ev.Message)
+			}
+		case <-deadline:
+			return nil, fmt.Errorf("timed out reading the history")
+		case <-gw.ctx.Done():
+			return nil, fmt.Errorf("shutting down")
+		}
+	}
+}
+
 // fallbackModels keeps the picker usable if the agent cannot be asked.
 func (gw *Gateway) fallbackModels(agent string) []ModelInfo {
 	var out []ModelInfo
@@ -1278,7 +1399,7 @@ func permLabel(mode string) string {
 func botCommands() []BotCommand {
 	return []BotCommand{
 		{"new", "start a session (agent and folder on buttons)"},
-		{"sessions", "list the running sessions"},
+		{"sessions", "browse past conversations and resume one"},
 		{"status", "what this session is, with its buttons"},
 		{"model", "pick the model, then its effort level"},
 		{"config", "permissions, thinking, limits, sandbox"},
@@ -1299,7 +1420,8 @@ func botCommands() []BotCommand {
 		{"run", "run a shell command in the folder"},
 		{"verbose", "show tool output and thinking"},
 		{"rename", "rename this topic"},
-		{"end", "close or delete this topic"},
+		{"end", "close the topic, or delete it and keep the session"},
+		{"services", "what an isolated session keeps running"},
 		{"help", "how this bot works"},
 		{"id", "chat, user and topic ids"},
 	}

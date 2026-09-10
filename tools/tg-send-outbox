@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""tg-send, as it works inside an isolated session.
+
+The real tg-send talks to Telegram, which needs the bot token. An isolated
+session must not hold that token - whoever works in the topic would be able to
+drive the whole bot - so in here the same command drops the file in the
+session's outbox instead, and the gateway posts it into the topic.
+
+    tg-send report.pdf
+    tg-send --caption "the finished build" app.apk
+    tg-send --text "done, the tests pass"
+
+The arguments are the ones the real tg-send takes, so a habit learned outside
+still works inside.
+"""
+import argparse
+import json
+import os
+import pathlib
+import shutil
+import sys
+import time
+
+OUTBOX = pathlib.Path(os.environ.get("AGENT_OUTBOX", "/workspace/outbox"))
+
+
+def unique(name):
+    dest = OUTBOX / name
+    if not dest.exists():
+        return dest
+    stem, suffix = dest.stem, dest.suffix
+    return OUTBOX / f"{stem}-{int(time.time())}{suffix}"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="deliver files into this session's Telegram topic")
+    ap.add_argument("files", nargs="*")
+    ap.add_argument("--caption", default="")
+    ap.add_argument("--text")
+    ap.add_argument("--where", action="store_true")
+    a = ap.parse_args()
+
+    OUTBOX.mkdir(parents=True, exist_ok=True)
+    if a.where:
+        print(json.dumps({"outbox": str(OUTBOX), "isolated": True}))
+        return
+    if a.text:
+        dest = unique("message-%d.txt" % int(time.time()))
+        dest.write_text(a.text)
+        (dest.parent / (dest.name + ".caption")).write_text(a.text[:900])
+        print(json.dumps({"ok": True, "queued": dest.name}))
+    for path in a.files:
+        src = pathlib.Path(path)
+        if not src.is_file():
+            sys.exit(f"not a file: {path}")
+        dest = unique(src.name)
+        shutil.copy2(src, dest)
+        if a.caption:
+            (dest.parent / (dest.name + ".caption")).write_text(a.caption)
+        print(json.dumps({"ok": True, "queued": dest.name, "size": dest.stat().st_size}))
+    if not a.files and not a.text:
+        ap.error("give a file or --text")
+
+
+if __name__ == "__main__":
+    main()

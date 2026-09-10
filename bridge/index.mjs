@@ -20,9 +20,18 @@ import path from 'node:path';
 import { spawn, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { listHistory } from './history.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORKER = path.join(HERE, 'worker.mjs');
+
+// The wrapper that builds a sandbox. It sits beside the bridge once
+// installed, and in the source tree while developing.
+const SANDBOX_RUN = process.env.TG_SANDBOX_RUN ||
+  path.join(path.dirname(HERE), 'tools', 'sandbox-run');
+// Where the bridge's own code appears inside a sandbox, and so where the
+// worker is started from in there.
+const GUEST_BRIDGE = '/opt/bridge';
 
 let pendingWork = 0; // async work that must finish before the process may exit
 
@@ -46,14 +55,31 @@ function agentOf(name) {
 
 const workers = new Map(); // sid -> worker record
 const configs = new Map(); // sid -> the last start command, replayed on respawn
+const sandboxes = new Map(); // sid -> the folder an isolated session lives in
 
 function worker(sid) {
   let w = workers.get(sid);
   if (w && w.proc && w.proc.exitCode === null && !w.proc.killed) return w;
 
-  const proc = spawn(process.execPath, [WORKER, sid], {
+  // An isolated session runs the whole worker inside the sandbox, so every
+  // agent - and every command any of them runs - is behind the same boundary
+  // rather than each having to be confined on its own terms.
+  const dir = sandboxes.get(sid);
+  const env = childEnv();
+  let command = process.execPath;
+  let argv = [WORKER, sid];
+  if (dir) {
+    env.SANDBOX_BRIDGE = HERE;
+    // Bring the session's own services back up first: there is no init in
+    // there, so a website it was running would otherwise be gone.
+    env.SANDBOX_RESUME = '1';
+    command = SANDBOX_RUN;
+    argv = [dir, '/usr/local/bin/node', path.join(GUEST_BRIDGE, 'worker.mjs'), sid];
+  }
+
+  const proc = spawn(command, argv, {
     cwd: HERE,
-    env: childEnv(),
+    env,
     stdio: ['pipe', 'pipe', 'pipe'],
     // Its own process group: killing -pid takes the agent and everything it
     // started (bash, compilers, servers) with it.
@@ -98,6 +124,7 @@ function worker(sid) {
   proc.on('exit', (code, signal) => {
     const wasRunning = rec.running;
     if (workers.get(sid) === rec) workers.delete(sid);
+    if (rec.quiet) return;
     if (rec.killedOnPurpose) {
       out({ type: 'killed', sid, message: 'killed the agent and everything it was running' });
       if (wasRunning) out({ type: 'done', sid, session: rec.last, subtype: 'killed', duration_ms: 0 });
@@ -112,6 +139,20 @@ function worker(sid) {
 }
 
 function send(sid, msg) {
+  // An isolated session names the folder its sandbox is built around. The
+  // cwd it also carries is already the path as seen from inside, so nothing
+  // below this point has to know the difference.
+  if (msg.sandbox_dir) {
+    if (sandboxes.get(sid) !== msg.sandbox_dir) {
+      // A different folder means a different sandbox, so the worker inside
+      // the old one cannot be reused.
+      if (workers.has(sid)) discardWorker(sid);
+      sandboxes.set(sid, msg.sandbox_dir);
+    }
+  } else if (msg.type === 'start') {
+    if (sandboxes.has(sid)) discardWorker(sid);
+    sandboxes.delete(sid);
+  }
   // Remember the session's settings so a worker that was killed comes back
   // configured. The gateway sends the whole set with every prompt, so this is
   // only the safety net for a respawn.
@@ -134,6 +175,22 @@ function send(sid, msg) {
     w.proc.stdin.write(JSON.stringify(msg) + '\n');
   } catch (err) {
     out({ type: 'error', sid, message: 'could not reach the agent process: ' + String(err?.message || err) });
+  }
+}
+
+// discardWorker ends a worker quietly, because the session it belongs to has
+// been reconfigured in a way it cannot follow - it moved in or out of a
+// sandbox. Nothing is reported: the next prompt starts a fresh one.
+function discardWorker(sid) {
+  const w = workers.get(sid);
+  workers.delete(sid);
+  if (!w || !w.proc || w.proc.exitCode !== null) return;
+  w.killedOnPurpose = true;
+  w.quiet = true;
+  try {
+    process.kill(-w.proc.pid, 'SIGKILL');
+  } catch {
+    try { w.proc.kill('SIGKILL'); } catch { /* already gone */ }
   }
 }
 
@@ -471,6 +528,18 @@ function handle(msg) {
       listSkills(agentOf(msg.agent))
         .then(skills => out({ type: 'skills', sid: msg.sid || '', agent: agentOf(msg.agent), skills }))
         .catch(err => out({ type: 'error', sid: msg.sid || '', message: 'skills: ' + String(err?.message || err) }))
+        .finally(() => { pendingWork--; });
+      break;
+    }
+    case 'history': {
+      // Reading a few hundred files off disk, so it is done off the main path
+      // and answered when it is ready.
+      pendingWork++;
+      const agent = agentOf(msg.agent);
+      Promise.resolve()
+        .then(() => listHistory(agent, msg.roots || [], msg.limit || 10))
+        .then(sessions => out({ type: 'history', sid: msg.sid || '', agent, sessions }))
+        .catch(err => out({ type: 'error', sid: msg.sid || '', message: 'history: ' + String(err?.message || err) }))
         .finally(() => { pendingWork--; });
       break;
     }

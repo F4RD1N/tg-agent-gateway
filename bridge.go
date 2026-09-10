@@ -30,6 +30,23 @@ type SkillInfo struct {
 	Body        string `json:"body,omitempty"` // codex prompts carry their text
 }
 
+// PastSession is one conversation an agent still has on disk, whether or not
+// this gateway ever knew about it.
+type PastSession struct {
+	ID       string `json:"id"`
+	Preview  string `json:"preview"`
+	Cwd      string `json:"cwd"`
+	When     string `json:"when"`
+	Messages int    `json:"messages"`
+	Isolated bool   `json:"isolated"`
+
+	// Filled in by the gateway, not the bridge: the archived session this
+	// conversation belongs to, if its topic was deleted while it was kept,
+	// and what that topic was called.
+	Kept string `json:"-"`
+	Name string `json:"-"`
+}
+
 // Event is one normalised message from the Node bridge.
 type Event struct {
 	Type    string `json:"type"`
@@ -56,9 +73,10 @@ type Event struct {
 		Done bool   `json:"done"`
 	} `json:"items,omitempty"`
 
-	// models and skills
-	Models []ModelInfo `json:"models,omitempty"`
-	Skills []SkillInfo `json:"skills,omitempty"`
+	// models, skills and past conversations
+	Models   []ModelInfo   `json:"models,omitempty"`
+	Skills   []SkillInfo   `json:"skills,omitempty"`
+	Sessions []PastSession `json:"sessions,omitempty"`
 
 	// done
 	Cost       float64 `json:"cost,omitempty"`
@@ -83,6 +101,14 @@ type Command struct {
 	Resume string   `json:"resume"`
 	Text   string   `json:"text,omitempty"`
 	Images []string `json:"images,omitempty"`
+
+	// SandboxDir is the folder an isolated session is confined to. When it is
+	// set the worker runs inside a sandbox built around that folder, and Cwd
+	// is the path as seen from in there.
+	SandboxDir string `json:"sandbox_dir,omitempty"`
+	// Roots and Limit belong to the history command.
+	Roots []string `json:"roots,omitempty"`
+	Limit int      `json:"limit,omitempty"`
 
 	// Deliberately not omitempty: the worker treats a missing field as "leave
 	// it alone", so an emptied setting - Default model, no effort - would
