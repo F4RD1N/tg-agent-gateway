@@ -182,7 +182,12 @@ session's folder.
 go test ./...                                  # fake Telegram + fake bridge, no network
 go test -race ./...                            # the same, checked for data races
 AGENT_LIVE=1 go test -run TestLiveAgents -v    # real turns against all three agents
+cd bridge && npm run lint                      # the sidecar, checked for undeclared names
 ```
+
+The suite runs the linter itself, because `node --check` only sees syntax: a
+name that was never declared throws at runtime, on whichever rare branch
+reaches it, which is exactly how one bug reached a live session.
 
 The Go tests run the whole update flow against an in-process Bot API stub, so
 button presses, topic creation, streaming edits, stopping and the pickers are

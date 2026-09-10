@@ -390,6 +390,14 @@ function isSafetyStop(text) {
   return SAFETY_STOP.test(String(text || ''));
 }
 
+// The SDKs report their own retries as errors. They are not failures - the
+// turn carries on - so they should not look like one.
+const TRANSIENT = /reconnect|stream disconnected|websocket closed|falling back from websockets|transport/i;
+
+function isTransient(text) {
+  return TRANSIENT.test(String(text || ''));
+}
+
 async function runCodex(s, text, images, recovered = false) {
   const ac = new AbortController();
   s.abort = () => ac.abort();
@@ -412,7 +420,17 @@ async function runCodex(s, text, images, recovered = false) {
   if (images && images.length) {
     input = [{ type: 'text', text }, ...images.map(path => ({ type: 'local_image', path }))];
   }
-  const started = await thread.runStreamed(input, { signal: ac.signal });
+  const abandoned = s.ref;
+  let safetyStopped = false;
+  let started;
+  try {
+    started = await thread.runStreamed(input, { signal: ac.signal });
+  } catch (err) {
+    if (!recovered && isSafetyStop(err?.message)) {
+      return recoverCodexThread(s, text, images, abandoned);
+    }
+    throw err;
+  }
   let usage = null;
   const t0 = Date.now();
 
@@ -482,6 +500,10 @@ async function runCodex(s, text, images, recovered = false) {
       case 'error':
         if (!recovered && isSafetyStop(ev.message)) {
           safetyStopped = true;
+          break;
+        }
+        if (isTransient(ev.message)) {
+          out({ type: 'note', sid: s.sid, message: 'connection hiccup, retrying' });
           break;
         }
         out({ type: 'error', sid: s.sid, message: clip(ev.message || 'error', 800) });
