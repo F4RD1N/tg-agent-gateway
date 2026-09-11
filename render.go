@@ -291,6 +291,11 @@ func (t *Turn) push(body string, withKeyboard bool) {
 		}
 		t.msgID = m.MessageID
 		t.lastSent = body
+		// Remember which message carries this turn's Stop and Kill buttons, so
+		// stopping it from elsewhere can take them off straight away.
+		t.gw.mu.Lock()
+		t.gw.turnMsg[t.threadID] = t.msgID
+		t.gw.mu.Unlock()
 		return
 	}
 	if err := t.gw.tg.Edit(ctx, t.chatID, t.msgID, body, kb); err != nil {

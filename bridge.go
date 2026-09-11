@@ -47,6 +47,36 @@ type PastSession struct {
 	Name string `json:"-"`
 }
 
+// WorkflowRun is one run of a Claude Code workflow: a crowd of agents driven
+// through phases by a script Claude wrote.
+type WorkflowRun struct {
+	ID         string          `json:"id"`
+	Name       string          `json:"name"`
+	Status     string          `json:"status"`
+	When       string          `json:"when"`
+	Live       bool            `json:"live"`
+	Mine       bool            `json:"mine"`
+	Summary    string          `json:"summary"`
+	Error      string          `json:"error"`
+	DurationMS int64           `json:"duration_ms"`
+	AgentCount int             `json:"agent_count"`
+	Tokens     int             `json:"tokens"`
+	ToolCalls  int             `json:"tool_calls"`
+	Phases     []string        `json:"phases"`
+	Logs       []string        `json:"logs"`
+	Agents     []WorkflowAgent `json:"agents"`
+}
+
+// WorkflowAgent is one of the agents a run is made of, and what it was last
+// seen doing.
+type WorkflowAgent struct {
+	Label string `json:"label"`
+	Phase string `json:"phase"`
+	State string `json:"state"`
+	Tool  string `json:"tool"`
+	Note  string `json:"note"`
+}
+
 // Event is one normalised message from the Node bridge.
 type Event struct {
 	Type    string `json:"type"`
@@ -73,10 +103,11 @@ type Event struct {
 		Done bool   `json:"done"`
 	} `json:"items,omitempty"`
 
-	// models, skills and past conversations
-	Models   []ModelInfo   `json:"models,omitempty"`
-	Skills   []SkillInfo   `json:"skills,omitempty"`
-	Sessions []PastSession `json:"sessions,omitempty"`
+	// models, skills, past conversations and workflow runs
+	Models    []ModelInfo   `json:"models,omitempty"`
+	Skills    []SkillInfo   `json:"skills,omitempty"`
+	Sessions  []PastSession `json:"sessions,omitempty"`
+	Workflows []WorkflowRun `json:"workflows,omitempty"`
 
 	// done
 	Cost       float64 `json:"cost,omitempty"`
@@ -106,9 +137,10 @@ type Command struct {
 	// set the worker runs inside a sandbox built around that folder, and Cwd
 	// is the path as seen from in there.
 	SandboxDir string `json:"sandbox_dir,omitempty"`
-	// Roots and Limit belong to the history command.
+	// Roots and Limit belong to the history command; RunID to the workflow one.
 	Roots []string `json:"roots,omitempty"`
 	Limit int      `json:"limit,omitempty"`
+	RunID string   `json:"run_id,omitempty"`
 
 	// Deliberately not omitempty: the worker treats a missing field as "leave
 	// it alone", so an emptied setting - Default model, no effort - would

@@ -10,6 +10,14 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { Codex } from '@openai/codex-sdk';
 
 const SID = process.argv[2] || '';
+
+// Ultracode: the effort level that means "put a crowd of agents on it".
+const ULTRACODE = 'ultracode';
+const ULTRACODE_ASK =
+  '[ultracode] I am explicitly asking for multi-agent orchestration on this: ' +
+  'use the Workflow tool to fan the work out across agents and verify the ' +
+  'results, rather than doing it all yourself, whenever the job is big enough ' +
+  'to be worth it. Say so plainly if it is not.\n\n';
 let codexClient = null;
 
 function out(obj) {
@@ -105,7 +113,7 @@ async function runClaude(s, text, images) {
     env: childEnv(),
   };
   if (s.model) opts.model = s.model;
-  if (s.effort) opts.effort = s.effort;
+  if (s.effort) opts.effort = s.effort === ULTRACODE ? 'xhigh' : s.effort;
   if (s.thinking > 0) opts.maxThinkingTokens = s.thinking;
   if (s.maxTurns > 0) opts.maxTurns = s.maxTurns;
   if (s.budget > 0) opts.maxBudgetUsd = s.budget;
@@ -117,6 +125,13 @@ async function runClaude(s, text, images) {
   let sawText = false;
 
   let prompt = text;
+  // Ultracode is xhigh thinking plus multi-agent orchestration. The effort
+  // name alone does not switch orchestration on through the SDK - the
+  // Workflow tool only acts when the person asks for one - so the asking is
+  // done here, in the words the tool is waiting for.
+  if (s.effort === ULTRACODE && typeof prompt === 'string' && !prompt.startsWith(ULTRACODE_ASK)) {
+    prompt = ULTRACODE_ASK + prompt;
+  }
   if (images && images.length) {
     // Claude Code views images with its Read tool; saying so plainly stops it
     // trying to cat the file first.

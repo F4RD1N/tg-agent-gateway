@@ -26,6 +26,8 @@ Each topic in this group is one agent session. Write a message in a topic and it
 /model /agent /effort — pick with buttons
 /mode — accept edits, plan, auto, manual…
 /skills — run a skill or command
+/workflows — recent workflow runs, with the live one updating itself
+/queue — messages waiting for the current turn to end
 /config — permissions, thinking, limits, sandbox
 /cd /pwd /ls — working folder
 /get &lt;file&gt; — send me a file
@@ -42,6 +44,8 @@ Each topic in this group is one agent session. Write a message in a topic and it
 <b>Isolated sessions</b>
 A sandbox session works in a folder of its own and sees nothing else of this server: no other projects, no memories, no settings. Pick <b>Isolated sandbox</b> instead of a folder when starting one, and say whether it is for you or for somebody else. A session made for somebody else answers only them.
 /services — what that session keeps running (there is no systemd inside; use <code>svc</code>)
+
+Write while the agent is working and I ask what to do with it: queue it, stop the turn and run it now, or forget it. A queue can hold as many messages as you like.
 
 Send a file to a topic and it lands in that session's folder. Anything else starting with / goes to the agent, so Claude's own commands work.`
 
@@ -215,6 +219,10 @@ func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 			}
 			go gw.runShell(thread, s, s.Cwd, arg)
 		})
+	case "workflows", "workflow":
+		gw.needSession(thread, sess, func(s *Session) { gw.showWorkflows(thread, 0, s) })
+	case "queue":
+		gw.needSession(thread, sess, func(s *Session) { gw.showQueue(thread) })
 	case "services", "svc":
 		gw.needSession(thread, sess, func(s *Session) {
 			if !s.Isolated {
@@ -1055,6 +1063,9 @@ func (gw *Gateway) presentEfforts(thread, editMsg int, sess *Session, models []M
 	var buttons []Button
 	for i, e := range m.Efforts {
 		label := strings.ToUpper(e[:1]) + e[1:]
+		if e == "ultracode" {
+			label = "🧩 Ultracode"
+		}
 		if e == m.DefaultEffort {
 			label += " ·default"
 		}
@@ -1073,6 +1084,9 @@ func (gw *Gateway) presentEfforts(thread, editMsg int, sess *Session, models []M
 		title += "\n<i>" + html.EscapeString(truncate(m.Description, 200)) + "</i>"
 	}
 	title += "\n\nHow hard should it think?"
+	if containsStr(m.Efforts, "ultracode") {
+		title += "\n<i>Ultracode is xhigh thinking plus orchestration: Claude may put a crowd of agents on a big job. Watch them with /workflows.</i>"
+	}
 	msgID := editMsg
 	if msgID > 0 {
 		gw.rememberMenu(msgID, &pending{kind: "effort", agent: sess.Agent, models: models, modelIdx: idx, threadID: thread})
@@ -1678,6 +1692,81 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 			gw.askGuestID(thread, msgID, agent, cq.From.ID)
 		default:
 			ack("")
+		}
+
+	case "wf":
+		if sess == nil {
+			ack("No session.")
+			return
+		}
+		if arg == "reload" || arg == "" {
+			ack("")
+			gw.showWorkflows(thread, msgID, sess)
+			return
+		}
+		p := gw.menu(msgID)
+		if p == nil {
+			ack("That menu expired.")
+			gw.showWorkflows(thread, msgID, sess)
+			return
+		}
+		i, err := strconv.Atoi(arg)
+		if err != nil || i < 0 || i >= len(p.runs) {
+			ack("")
+			return
+		}
+		ack("")
+		gw.showWorkflow(thread, msgID, sess, p.runs[i].ID)
+
+	case "wfr":
+		if sess == nil {
+			ack("No session.")
+			return
+		}
+		ack("")
+		gw.showWorkflow(thread, msgID, sess, arg)
+
+	case "q":
+		switch arg {
+		case "clear":
+			n := gw.clearQueue(thread)
+			ack("Cleared")
+			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID,
+				fmt.Sprintf("🧹 <i>dropped %s from the queue</i>", plural(n, "message", "messages")), nil)
+			return
+		}
+		p := gw.takeMenu(msgID)
+		if p == nil || p.kind != "queue" {
+			ack("That message is no longer waiting.")
+			_ = gw.tg.EditKeyboard(gw.ctx, gw.cfg.ChatID, msgID, nil)
+			return
+		}
+		prompt := pendingPrompt{text: p.prompt, images: p.images}
+		switch arg {
+		case "add":
+			n := gw.enqueue(thread, prompt)
+			ack("Queued")
+			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID,
+				fmt.Sprintf("➕ <b>Queued</b> — number %d in line\n\n%s", n, blockquote(p.prompt, p.images)), nil)
+		case "now":
+			if sess == nil {
+				ack("No session.")
+				return
+			}
+			// It goes to the front, and the turn in flight is interrupted; the
+			// queue drains as soon as that turn lets go of the topic.
+			gw.jump(thread, prompt)
+			ack("Stopping")
+			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID,
+				"⏹ <b>Stopping the current step</b>, then this one runs\n\n"+blockquote(p.prompt, p.images), nil)
+			gw.endTurnKeyboard(thread)
+			if err := gw.bridge.Send(Command{Type: "interrupt", SID: sidOf(thread)}); err != nil {
+				gw.reply(thread, "⚠️ "+html.EscapeString(err.Error()), nil)
+			}
+		default:
+			ack("Dismissed")
+			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID,
+				"✖️ <i>not sent</i>\n\n"+blockquote(p.prompt, p.images), nil)
 		}
 
 	case "services":

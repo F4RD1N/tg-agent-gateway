@@ -191,6 +191,35 @@ func buttons(c *sentCall) []string {
 	return out
 }
 
+// targetID is the message a recorded call acted on: the one an edit changed,
+// or the one a send created.
+func targetID(c *sentCall) int {
+	if v, ok := c.Params["message_id"].(float64); ok {
+		return int(v)
+	}
+	return c.ID
+}
+
+// buttonLabels pulls the visible text off a recorded call's keyboard.
+func buttonLabels(c *sentCall) []string {
+	var out []string
+	rm, ok := c.Params["reply_markup"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	rows, _ := rm["inline_keyboard"].([]any)
+	for _, row := range rows {
+		for _, b := range row.([]any) {
+			if m, ok := b.(map[string]any); ok {
+				if t, ok := m["text"].(string); ok {
+					out = append(out, t)
+				}
+			}
+		}
+	}
+	return out
+}
+
 // keyboardAsMap round-trips a keyboard the way the fake API sees it.
 func keyboardAsMap(kb *Keyboard) map[string]any {
 	data, _ := json.Marshal(kb)

@@ -21,6 +21,7 @@ import { spawn, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { listHistory } from './history.mjs';
+import { listWorkflows, workflowDetail } from './workflows.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORKER = path.join(HERE, 'worker.mjs');
@@ -276,7 +277,7 @@ async function claudeModels() {
       id: m.value,
       label: cleanLabel(m.displayName || m.value),
       description: m.description || '',
-      efforts: m.supportsEffort ? (m.supportedEffortLevels || []) : [],
+      efforts: withUltracode(m.supportsEffort ? (m.supportedEffortLevels || []) : []),
       default_effort: '',
     }));
   } finally {
@@ -284,6 +285,15 @@ async function claudeModels() {
     try { await q.return?.(); } catch { /* already closed */ }
     ac.abort();
   }
+}
+
+// withUltracode adds the effort the model list leaves out. Ultracode is
+// xhigh thinking plus dynamic workflow orchestration - Claude writes a script
+// that drives a crowd of agents - and Claude Code only offers it on a model
+// that can do xhigh in the first place.
+function withUltracode(efforts) {
+  if (!efforts.includes('xhigh') || efforts.includes('ultracode')) return efforts;
+  return [...efforts, 'ultracode'];
 }
 
 // cleanLabel drops the parenthetical noise Claude puts in display names, so
@@ -540,6 +550,25 @@ function handle(msg) {
         .then(() => listHistory(agent, msg.roots || [], msg.limit || 10))
         .then(sessions => out({ type: 'history', sid: msg.sid || '', agent, sessions }))
         .catch(err => out({ type: 'error', sid: msg.sid || '', message: 'history: ' + String(err?.message || err) }))
+        .finally(() => { pendingWork--; });
+      break;
+    }
+    case 'workflows': {
+      // Reading transcripts off disk, so it is answered when it is ready.
+      pendingWork++;
+      Promise.resolve()
+        .then(() => listWorkflows(msg.cwd || '', msg.resume || '', msg.limit || 7))
+        .then(workflows => out({ type: 'workflows', sid: msg.sid || '', workflows }))
+        .catch(err => out({ type: 'error', sid: msg.sid || '', message: 'workflows: ' + String(err?.message || err) }))
+        .finally(() => { pendingWork--; });
+      break;
+    }
+    case 'workflow': {
+      pendingWork++;
+      Promise.resolve()
+        .then(() => workflowDetail(msg.cwd || '', msg.resume || '', msg.run_id || ''))
+        .then(w => out({ type: 'workflow', sid: msg.sid || '', workflows: w ? [w] : [] }))
+        .catch(err => out({ type: 'error', sid: msg.sid || '', message: 'workflow: ' + String(err?.message || err) }))
         .finally(() => { pendingWork--; });
       break;
     }

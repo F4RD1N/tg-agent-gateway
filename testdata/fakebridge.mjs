@@ -55,6 +55,49 @@ rl.on('line', line => {
       out({ type: 'history', sid: m.sid || '', agent, sessions });
       break;
     }
+    case 'workflows': {
+      const runs = [];
+      for (let i = 0; i < (m.limit || 7); i++) {
+        runs.push({
+          id: `wf_fake-${i}`,
+          name: `rollout-${i}`,
+          status: i === 0 ? 'running' : 'completed',
+          when: new Date(Date.now() - i * 3600e3).toISOString(),
+          live: i === 0,
+          mine: true,
+          summary: `what run ${i} was for`,
+          error: '',
+          duration_ms: 60000 + i * 1000,
+          agent_count: 2 + i,
+          tokens: 1000 * (i + 1),
+          tool_calls: 3 + i,
+          phases: ['Review', 'Verify'],
+          logs: [`step one of ${i}`, `step two of ${i}`],
+          agents: [
+            { label: 'review:bugs', phase: 'Review', state: i === 0 ? 'running' : 'done', tool: 'Bash', note: 'go test ./...' },
+            { label: 'verify:bugs', phase: 'Verify', state: 'done', tool: '', note: 'checked it' },
+          ],
+        });
+      }
+      out({ type: 'workflows', sid: m.sid || '', workflows: runs });
+      break;
+    }
+    case 'workflow': {
+      const id = m.run_id || 'wf_fake-0';
+      const live = id === 'wf_fake-0' && !global.__wfFinished;
+      out({ type: 'workflow', sid: m.sid || '', workflows: [{
+        id, name: 'rollout-' + id.slice(-1), status: live ? 'running' : 'completed',
+        when: new Date().toISOString(), live, mine: true,
+        summary: 'what it was for', error: '', duration_ms: 61000,
+        agent_count: 2, tokens: 4321, tool_calls: 9,
+        phases: ['Review', 'Verify'], logs: ['step one', 'step two'],
+        agents: [{ label: 'review:bugs', phase: 'Review', state: live ? 'running' : 'done', tool: 'Bash', note: 'go test ./...' }],
+      }] });
+      // The next look at this run says it finished, so a test can watch the
+      // live view settle instead of redrawing for ever.
+      global.__wfFinished = true;
+      break;
+    }
     case 'start':
     case 'clear':
     case 'stop':

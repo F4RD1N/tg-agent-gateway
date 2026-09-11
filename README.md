@@ -64,6 +64,18 @@ does kill everything that session started.
   command line. Switch Details on for the list of steps, folded away.
   **Stop** ends the turn but leaves it resumable; **Kill** takes down the
   agent process and every command it started.
+- **Write while it is working.** A message sent mid-turn is not lost and does
+  not interrupt anything by surprise. The bot asks what to do with it:
+  **Add to Queue** runs it when the current turn ends, **Stop and Apply** stops
+  the turn and runs it now (taking the Stop and Kill buttons off the log it
+  just ended), **Dismiss** forgets it. Queue as many as you like and they run
+  in order; `/queue` lists them.
+- **Ultracode, and the workflows it starts.** The effort picker for Claude
+  models offers **Ultracode** alongside low … max: xhigh thinking plus
+  multi-agent orchestration, so a big job is fanned out across a crowd of
+  agents and verified rather than done alone. `/workflows` then shows the last
+  seven runs in that folder; open one for its phases, its agents and its log,
+  and a run still going **redraws itself** every few seconds until it ends.
 - **Many topics at once.** Sessions run in parallel; the edit pacing widens
   automatically as more of them stream, so they do not trip Telegram's
   group-wide flood limit.
@@ -156,6 +168,8 @@ In a **topic**:
 | `/model` | the agent's full model list, then its effort levels |
 | `/mode` | accept edits, plan, don't ask, auto, manual |
 | `/skills` | run a skill, plugin command or prompt file |
+| `/workflows` | the last seven workflow runs, with the live one updating itself |
+| `/queue` | messages waiting for the current turn to end |
 | `/config` | permissions, thinking, limits, sandbox — all on buttons |
 | `/agent` | switch between Claude Code and Codex |
 | `/cd` `/pwd` `/ls` | working folder (`/cd` browses with buttons) |

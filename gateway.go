@@ -40,11 +40,14 @@ type pending struct {
 	models   []ModelInfo
 	skills   []SkillInfo
 	past     []PastSession
+	runs     []WorkflowRun
 	page     int
 	modelIdx int
 	threadID int
-	isolated bool  // this session is being created behind a sandbox
-	owner    int64 // the one person the session belongs to, if it is for somebody else
+	isolated bool     // this session is being created behind a sandbox
+	owner    int64    // the one person the session belongs to, if it is for somebody else
+	prompt   string   // a message waiting to be queued, applied or dropped
+	images   []string // and whatever came attached to it
 	expires  time.Time
 }
 
@@ -76,6 +79,9 @@ type Gateway struct {
 	skillsBy map[string]skillCacheEntry
 	albums   map[string]*album
 	waiting  map[int]*fileWait
+	watching map[int]string // message id -> the workflow run it is redrawing
+	turnMsg  map[int]int    // thread -> the message the running turn is writing
+	queued   map[int][]pendingPrompt
 	reqSeq   int64
 }
 
@@ -108,6 +114,9 @@ func NewGateway(ctx context.Context, cfg *Config, store *Store) *Gateway {
 		skillsBy: map[string]skillCacheEntry{},
 		albums:   map[string]*album{},
 		waiting:  map[int]*fileWait{},
+		watching: map[int]string{},
+		turnMsg:  map[int]int{},
+		queued:   map[int][]pendingPrompt{},
 	}
 }
 
@@ -397,9 +406,9 @@ func (gw *Gateway) submitPrompt(sess *Session, text string, images []string) {
 	}
 	gw.mu.Unlock()
 	if busy {
-		gw.reply(sess.ThreadID, "⏳ That session is still working. Stop it, kill it, or wait.", Rows(
-			[]Button{{Text: "⏹ Stop", CallbackData: "stop"}, {Text: "💀 Kill", CallbackData: "kill"}},
-		))
+		// Ask what to do with it rather than dropping it: queue it behind the
+		// turn in flight, stop that turn and run this instead, or forget it.
+		gw.offerQueue(sess, text, images)
 		return
 	}
 	if !gw.bridge.Alive() {
@@ -436,9 +445,12 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string, images []string)
 		gw.bridge.Unsubscribe(sid, ch)
 		gw.mu.Lock()
 		delete(gw.running, sess.ThreadID)
+		delete(gw.turnMsg, sess.ThreadID)
 		gw.mu.Unlock()
 		// Whatever the turn left for delivery goes out now, however it ended.
 		gw.drainOutbox(sess)
+		// And whatever was written while it was working goes in now.
+		guard("queue", func() { gw.drainQueue(sess) })
 	}()
 
 	gw.tg.TypingAction(gw.ctx, gw.cfg.ChatID, sess.ThreadID)
@@ -716,17 +728,29 @@ func (gw *Gateway) sessionKeyboard(sess *Session) *Keyboard {
 		{{Text: "🧩 Skills", CallbackData: "skills"}, {Text: "⚙️ Config", CallbackData: "cfg"}},
 		{{Text: "🔎 Details: " + onOff(sess.Verbose), CallbackData: "verbose"}, {Text: "🔓 Mode", CallbackData: "cfg:perm"}},
 	}
+	// The row above the destructive one carries whatever this session has that
+	// the others do not: services inside a sandbox, workflows under Claude.
+	var extra []Button
 	if sess.Isolated {
 		// There is no systemd inside a sandbox, so what is running there is
 		// worth a button of its own.
-		rows = append(rows, []Button{{Text: "🛠 Services", CallbackData: "services"}, {Text: "🧹 New thread", CallbackData: "clear"}})
-		rows = append(rows, []Button{{Text: "💀 Kill processes", CallbackData: "kill"}, {Text: "🗑 End session", CallbackData: "end"}})
+		extra = append(extra, Button{Text: "🛠 Services", CallbackData: "services"})
+	}
+	if sess.Agent == "claude" {
+		extra = append(extra, Button{Text: "🧵 Workflows", CallbackData: "wf:reload"})
+	}
+	extra = append(extra, Button{Text: "🧹 New thread", CallbackData: "clear"})
+	for len(extra) >= 2 {
+		rows = append(rows, extra[:2])
+		extra = extra[2:]
+	}
+	last := []Button{{Text: "💀 Kill processes", CallbackData: "kill"}, {Text: "🗑 End session", CallbackData: "end"}}
+	if len(extra) == 1 {
+		rows = append(rows, []Button{extra[0], last[0]})
+		rows = append(rows, []Button{last[1]})
 		return Rows(rows...)
 	}
-	rows = append(rows,
-		[]Button{{Text: "🧹 New thread", CallbackData: "clear"}, {Text: "💀 Kill processes", CallbackData: "kill"}},
-		[]Button{{Text: "🗑 End session", CallbackData: "end"}},
-	)
+	rows = append(rows, last)
 	return Rows(rows...)
 }
 
@@ -1020,6 +1044,20 @@ func (gw *Gateway) menu(msgID int) *pending {
 	p := gw.menus[msgID]
 	if p != nil && time.Now().After(p.expires) {
 		delete(gw.menus, msgID)
+		return nil
+	}
+	return p
+}
+
+// takeMenu is menu(), for a menu that may only be answered once. The offer on
+// a message held back mid-turn is one of those: tapping Add twice must not
+// queue it twice.
+func (gw *Gateway) takeMenu(msgID int) *pending {
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	p := gw.menus[msgID]
+	delete(gw.menus, msgID)
+	if p != nil && time.Now().After(p.expires) {
 		return nil
 	}
 	return p
@@ -1405,6 +1443,8 @@ func botCommands() []BotCommand {
 		{"config", "permissions, thinking, limits, sandbox"},
 		{"mode", "accept edits, plan, auto, manual…"},
 		{"skills", "run a skill, prompt or command"},
+		{"workflows", "recent workflow runs, and the live one"},
+		{"queue", "messages waiting for the current turn to end"},
 		{"agent", "switch between Claude Code and Codex"},
 		{"effort", "how hard the model should think"},
 		{"compact", "compact the agent's context"},

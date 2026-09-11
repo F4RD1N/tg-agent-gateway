@@ -119,7 +119,7 @@ log "installed $BIN ($VERSION)"
 
 log "installing the agent bridge"
 mkdir -p "$APPDIR/bridge"
-for f in index.mjs worker.mjs history.mjs; do
+for f in index.mjs worker.mjs history.mjs workflows.mjs; do
   install -m 0644 "$SRC/bridge/$f" "$APPDIR/bridge/$f"
 done
 install -m 0644 "$SRC/bridge/package.json" "$APPDIR/bridge/package.json"
