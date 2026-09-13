@@ -130,7 +130,7 @@ func (gw *Gateway) command(kind string, sess *Session, text string) Command {
 		Model: sess.Model, Effort: sess.Effort, Resume: sess.Ref, Text: text,
 		PermMode: sess.PermMode, Thinking: sess.Thinking, MaxTurns: sess.MaxTurns,
 		BudgetUSD: sess.BudgetUSD, NoUserSettings: sess.NoUserSettings, Fallback: sess.Fallback,
-		Sandbox: sess.Sandbox, Approval: sess.Approval,
+		Sandbox: sess.Sandbox, Approval: sess.Approval, Fast: sess.Fast,
 		WebSearch: sess.WebSearch, Network: sess.Network,
 		TGChat:  strconv.FormatInt(gw.cfg.ChatID, 10),
 		TGTopic: strconv.Itoa(sess.ThreadID),
@@ -705,6 +705,9 @@ func (gw *Gateway) sessionHeader(sess *Session) string {
 	if sess.Effort != "" {
 		s += " · ⚡" + html.EscapeString(sess.Effort)
 	}
+	if speed := fastLabel(sess); speed != "" {
+		s += " · " + speed
+	}
 	if !gw.agentInstalled(sess.Agent) {
 		s += "\n⚠️ <i>" + agentLabel(sess.Agent) + " is not installed on this server</i>"
 	}
@@ -738,6 +741,9 @@ func (gw *Gateway) sessionKeyboard(sess *Session) *Keyboard {
 	}
 	if sess.Agent == "claude" {
 		extra = append(extra, Button{Text: "🧵 Workflows", CallbackData: "wf:reload"})
+	}
+	if sess.Agent == "codex" {
+		extra = append(extra, fastButton(sess))
 	}
 	extra = append(extra, Button{Text: "🧹 New thread", CallbackData: "clear"})
 	for len(extra) >= 2 {
@@ -1444,6 +1450,7 @@ func botCommands() []BotCommand {
 		{"mode", "accept edits, plan, auto, manual…"},
 		{"skills", "run a skill, prompt or command"},
 		{"workflows", "recent workflow runs, and the live one"},
+		{"fast", "Codex's priority tier: same model, twice the speed"},
 		{"queue", "messages waiting for the current turn to end"},
 		{"agent", "switch between Claude Code and Codex"},
 		{"effort", "how hard the model should think"},

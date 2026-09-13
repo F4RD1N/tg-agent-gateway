@@ -159,6 +159,7 @@ type Command struct {
 	TGTitle   string `json:"tg_title,omitempty"`
 	Sandbox   string `json:"sandbox"`
 	Approval  string `json:"approval"`
+	Fast      string `json:"fast"`
 	WebSearch string `json:"web_search"`
 	Network   string `json:"network"`
 }

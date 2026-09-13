@@ -28,9 +28,17 @@ function getCodex() {
   // The SDK stops inheriting process.env once env is supplied, so the full
   // environment is passed through with the topic destination added.
   const env = childEnv();
-  const key = JSON.stringify([env.AGENT_TG_CHAT_ID, env.AGENT_TG_TOPIC_ID]);
+  // Codex's speed setting is a config key rather than a thread option, so it
+  // belongs to the client and a change to it needs a new one.
+  const config = {};
+  // "fast" is the priority lane the models advertise; "default" is the
+  // ordinary one. Codex warns and ignores anything else, so these two are the
+  // only values worth sending.
+  if (s.fast === 'on') config.service_tier = 'fast';
+  else if (s.fast === 'off') config.service_tier = 'default';
+  const key = JSON.stringify([env.AGENT_TG_CHAT_ID, env.AGENT_TG_TOPIC_ID, s.fast || '']);
   if (!codexClient || codexClient.__key !== key) {
-    codexClient = new Codex({ env });
+    codexClient = new Codex({ env, config });
     codexClient.__key = key;
   }
   return codexClient;
@@ -55,7 +63,7 @@ function childEnv() {
 const s = {
   sid: SID, agent: 'claude', cwd: process.cwd(), model: '', effort: '', ref: '',
   permMode: '', thinking: 0, maxTurns: 0, budget: 0, noUserSettings: false, fallback: '',
-  sandbox: '', approval: '', webSearch: '', network: '',
+  sandbox: '', approval: '', webSearch: '', network: '', fast: '',
   tgChat: '', tgTopic: '', tgToken: '', tgTitle: '',
   queue: [], running: false, abort: null,
 };
@@ -74,6 +82,7 @@ function applyConfig(s, msg) {
   if (msg.tg_title !== undefined) s.tgTitle = msg.tg_title || '';
   s.sandbox = msg.sandbox || '';
   s.approval = msg.approval || '';
+  s.fast = msg.fast || '';
   s.webSearch = msg.web_search || '';
   s.network = msg.network || '';
 }

@@ -76,6 +76,10 @@ does kill everything that session started.
   agents and verified rather than done alone. `/workflows` then shows the last
   seven runs in that folder; open one for its phases, its agents and its log,
   and a run still going **redraws itself** every few seconds until it ends.
+- **Fast, for Codex.** `/fast` in a Codex topic switches it to Codex's
+  priority tier: the same model served about twice as quickly, against more of
+  the plan's usage. Three states, because this machine has a setting of its
+  own: on, standard, or follow `service_tier` in `~/.codex/config.toml`.
 - **Many topics at once.** Sessions run in parallel; the edit pacing widens
   automatically as more of them stream, so they do not trip Telegram's
   group-wide flood limit.
@@ -169,6 +173,7 @@ In a **topic**:
 | `/mode` | accept edits, plan, don't ask, auto, manual |
 | `/skills` | run a skill, plugin command or prompt file |
 | `/workflows` | the last seven workflow runs, with the live one updating itself |
+| `/fast` | Codex only: its priority tier, the same model about twice as fast |
 | `/queue` | messages waiting for the current turn to end |
 | `/config` | permissions, thinking, limits, sandbox — all on buttons |
 | `/agent` | switch between Claude Code and Codex |

@@ -45,8 +45,11 @@ type Session struct {
 	Fallback       string  `json:"fallback_model,omitempty"`   // claude: switch to this when a message is flagged
 	Sandbox        string  `json:"sandbox,omitempty"`          // codex
 	Approval       string  `json:"approval,omitempty"`         // codex
-	WebSearch      string  `json:"web_search,omitempty"`       // codex: on | off
-	Network        string  `json:"network,omitempty"`          // codex: on | off
+	// Fast is Codex's priority service tier: "on" asks for it, "off" refuses
+	// it, empty leaves the machine's own setting alone.
+	Fast      string `json:"fast,omitempty"`       // codex
+	WebSearch string `json:"web_search,omitempty"` // codex: on | off
+	Network   string `json:"network,omitempty"`    // codex: on | off
 
 	Cost     float64   `json:"cost"`
 	Turns    int       `json:"turns"`

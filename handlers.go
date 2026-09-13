@@ -27,6 +27,7 @@ Each topic in this group is one agent session. Write a message in a topic and it
 /mode — accept edits, plan, auto, manual…
 /skills — run a skill or command
 /workflows — recent workflow runs, with the live one updating itself
+/fast — Codex only: its priority tier, the same model about twice as fast
 /queue — messages waiting for the current turn to end
 /config — permissions, thinking, limits, sandbox
 /cd /pwd /ls — working folder
@@ -219,6 +220,8 @@ func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 			}
 			go gw.runShell(thread, s, s.Cwd, arg)
 		})
+	case "fast":
+		gw.needSession(thread, sess, func(s *Session) { gw.toggleFast(thread, s, arg) })
 	case "workflows", "workflow":
 		gw.needSession(thread, sess, func(s *Session) { gw.showWorkflows(thread, 0, s) })
 	case "queue":
@@ -356,6 +359,16 @@ func configOptions() []configOption {
 				return s.PermMode
 			},
 			Apply: func(s *Session, v string) { s.PermMode = v },
+		},
+		{
+			Key: "fast", Icon: "⚡", Label: "Speed", Agent: "codex",
+			Choices: []Choice{
+				{ID: "", Label: "This machine's setting"},
+				{ID: "on", Label: "Fast"},
+				{ID: "off", Label: "Standard"},
+			},
+			Current: func(s *Session) string { return s.Fast },
+			Apply:   func(s *Session, v string) { s.Fast = v },
 		},
 		{
 			Key: "sandbox", Icon: "🏖", Label: "Sandbox", Agent: "codex",
@@ -1768,6 +1781,14 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 			_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID,
 				"✖️ <i>not sent</i>\n\n"+blockquote(p.prompt, p.images), nil)
 		}
+
+	case "fast":
+		if sess == nil {
+			ack("No session.")
+			return
+		}
+		ack("")
+		gw.toggleFast(thread, sess, arg)
 
 	case "services":
 		if sess == nil {
