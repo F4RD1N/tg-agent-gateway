@@ -8,6 +8,7 @@ import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { Codex } from '@openai/codex-sdk';
+import { runCodexStream } from './codex-turn.mjs';
 
 const SID = process.argv[2] || '';
 
@@ -410,25 +411,7 @@ function agyToolDetail(name, info) {
 
 // ---------------------------------------------------------------- codex
 
-// Codex sometimes ends a thread with "Chat stopped as a precaution", and that
-// thread can never be resumed again - resuming it just fails the same way. The
-// way through is the one a person would take: start a fresh thread and tell it
-// to pick up the abandoned one's work.
-const SAFETY_STOP = /stopped as a precaution|acting safely|start or resume another chat|resume another chat/i;
-
-function isSafetyStop(text) {
-  return SAFETY_STOP.test(String(text || ''));
-}
-
-// The SDKs report their own retries as errors. They are not failures - the
-// turn carries on - so they should not look like one.
-const TRANSIENT = /reconnect|stream disconnected|websocket closed|falling back from websockets|transport/i;
-
-function isTransient(text) {
-  return TRANSIENT.test(String(text || ''));
-}
-
-async function runCodex(s, text, images, recovered = false) {
+async function runCodex(s, text, images) {
   const ac = new AbortController();
   s.abort = () => ac.abort();
   const threadOpts = {
@@ -450,99 +433,63 @@ async function runCodex(s, text, images, recovered = false) {
   if (images && images.length) {
     input = [{ type: 'text', text }, ...images.map(path => ({ type: 'local_image', path }))];
   }
-  const abandoned = s.ref;
-  let safetyStopped = false;
-  let started;
-  try {
-    started = await thread.runStreamed(input, { signal: ac.signal });
-  } catch (err) {
-    if (!recovered && isSafetyStop(err?.message)) {
-      return recoverCodexThread(s, text, images, abandoned);
-    }
-    throw err;
-  }
-  let usage = null;
   const t0 = Date.now();
-
-  for await (const ev of started.events) {
-    switch (ev.type) {
-      case 'thread.started':
-        s.ref = ev.thread_id;
-        out({ type: 'started', sid: s.sid, agent: 'codex', session: ev.thread_id, model: s.model });
-        break;
-      case 'item.started':
-      case 'item.updated':
-      case 'item.completed': {
-        const it = ev.item;
-        const done = ev.type === 'item.completed';
-        switch (it.type) {
-          case 'agent_message':
-            if (done && it.text) out({ type: 'text', sid: s.sid, text: it.text });
-            break;
-          case 'reasoning':
-            if (done && it.text) out({ type: 'thinking', sid: s.sid, text: it.text });
-            break;
-          case 'command_execution':
-            out({
-              type: 'tool', sid: s.sid,
-              status: it.status === 'in_progress' ? 'start' : (it.status === 'failed' || (it.exit_code ?? 0) !== 0 ? 'fail' : 'ok'),
-              name: 'Bash',
-              detail: it.status === 'in_progress' ? clip(it.command, 300) : clip(it.aggregated_output || '', 700),
-            });
-            break;
-          case 'file_change':
-            if (done) {
-              for (const ch of it.changes || []) {
-                out({ type: 'file', sid: s.sid, path: ch.path, kind: ch.kind, ok: it.status === 'completed' });
+  const { usage } = await runCodexStream({
+    thread, input, signal: ac.signal,
+    onNotice: message => out({ type: 'note', sid: s.sid, message }),
+    onEvent: ev => {
+      switch (ev.type) {
+        case 'thread.started':
+          s.ref = ev.thread_id;
+          out({ type: 'started', sid: s.sid, agent: 'codex', session: ev.thread_id, model: s.model });
+          break;
+        case 'item.started':
+        case 'item.updated':
+        case 'item.completed': {
+          const it = ev.item;
+          const done = ev.type === 'item.completed';
+          switch (it.type) {
+            case 'agent_message':
+              if (done && it.text) out({ type: 'text', sid: s.sid, text: it.text });
+              break;
+            case 'reasoning':
+              if (done && it.text) out({ type: 'thinking', sid: s.sid, text: it.text });
+              break;
+            case 'command_execution':
+              out({
+                type: 'tool', sid: s.sid,
+                status: it.status === 'in_progress' ? 'start' : (it.status === 'failed' || (it.exit_code ?? 0) !== 0 ? 'fail' : 'ok'),
+                name: 'Bash',
+                detail: it.status === 'in_progress' ? clip(it.command, 300) : clip(it.aggregated_output || '', 700),
+              });
+              break;
+            case 'file_change':
+              if (done) {
+                for (const ch of it.changes || []) {
+                  out({ type: 'file', sid: s.sid, path: ch.path, kind: ch.kind, ok: it.status === 'completed' });
+                }
               }
-            }
-            break;
-          case 'mcp_tool_call':
-            out({
-              type: 'tool', sid: s.sid,
-              status: it.status === 'in_progress' ? 'start' : (it.status === 'failed' ? 'fail' : 'ok'),
-              name: `${it.server}/${it.tool}`,
-              detail: it.error ? clip(it.error.message, 300) : clip(JSON.stringify(it.arguments || {}), 300),
-            });
-            break;
-          case 'web_search':
-            if (done) out({ type: 'tool', sid: s.sid, status: 'ok', name: 'WebSearch', detail: clip(it.query, 200) });
-            break;
-          case 'todo_list':
-            if (done) out({ type: 'todo', sid: s.sid, items: (it.items || []).map(i => ({ text: i.text, done: !!i.completed })) });
-            break;
-          case 'error':
-            out({ type: 'error', sid: s.sid, message: clip(it.message, 800) });
-            break;
+              break;
+            case 'mcp_tool_call':
+              out({
+                type: 'tool', sid: s.sid,
+                status: it.status === 'in_progress' ? 'start' : (it.status === 'failed' ? 'fail' : 'ok'),
+                name: `${it.server}/${it.tool}`,
+                detail: it.error ? clip(it.error.message, 300) : clip(JSON.stringify(it.arguments || {}), 300),
+              });
+              break;
+            case 'web_search':
+              if (done) out({ type: 'tool', sid: s.sid, status: 'ok', name: 'WebSearch', detail: clip(it.query, 200) });
+              break;
+            case 'todo_list':
+              if (done) out({ type: 'todo', sid: s.sid, items: (it.items || []).map(i => ({ text: i.text, done: !!i.completed })) });
+              break;
+          }
+          break;
         }
-        break;
       }
-      case 'turn.completed':
-        usage = ev.usage || null;
-        break;
-      case 'turn.failed':
-        if (!recovered && isSafetyStop(ev.error?.message)) {
-          safetyStopped = true;
-          break;
-        }
-        out({ type: 'error', sid: s.sid, message: clip(ev.error?.message || 'turn failed', 800) });
-        break;
-      case 'error':
-        if (!recovered && isSafetyStop(ev.message)) {
-          safetyStopped = true;
-          break;
-        }
-        if (isTransient(ev.message)) {
-          out({ type: 'note', sid: s.sid, message: 'connection hiccup, retrying' });
-          break;
-        }
-        out({ type: 'error', sid: s.sid, message: clip(ev.message || 'error', 800) });
-        break;
-    }
-  }
-  if (safetyStopped) {
-    return recoverCodexThread(s, text, images, abandoned);
-  }
+    },
+  });
   out({
     type: 'done', sid: s.sid, session: s.ref,
     cost: 0,
@@ -550,26 +497,6 @@ async function runCodex(s, text, images, recovered = false) {
     tokens: usage ? { input: (usage.input_tokens || 0), output: (usage.output_tokens || 0) } : null,
     subtype: 'success',
   });
-}
-
-// recoverCodexThread starts a clean thread and asks it to take over the work
-// of the one Codex refuses to continue.
-async function recoverCodexThread(s, text, images, abandoned) {
-  s.ref = '';
-  out({
-    type: 'note', sid: s.sid,
-    message: abandoned
-      ? 'Codex stopped that thread as a precaution. Carrying the work into a fresh one.'
-      : 'Codex stopped as a precaution. Trying again in a fresh thread.',
-  });
-  let prompt = text;
-  if (abandoned) {
-    prompt =
-      'Your previous session (' + abandoned + ') was stopped by a safety check and cannot be resumed. ' +
-      'Find its transcript under ~/.codex/sessions (search for that id), read what was already done, ' +
-      'and carry that work on in this session.\n\n' + text;
-  }
-  return runCodex(s, prompt, images, true);
 }
 
 // ---------------------------------------------------------------- queue

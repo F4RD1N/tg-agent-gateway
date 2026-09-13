@@ -13,6 +13,7 @@
     "eslint": "^9.39.5"
   },
   "scripts": {
-    "lint": "eslint index.mjs worker.mjs"
+    "lint": "eslint index.mjs worker.mjs codex-turn.mjs codex-turn.test.mjs",
+    "test": "node --test codex-turn.test.mjs"
   }
 }
