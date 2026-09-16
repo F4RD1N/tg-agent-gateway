@@ -41,6 +41,25 @@ test('deduplicates SDK reconnect notices and accepts only a completed turn', asy
   assert.deepEqual(state.emitted, [message]);
 });
 
+test('WebSocket fallback remains a notice when HTTPS completes the turn', async () => {
+  const fallback = 'Falling back from WebSockets to HTTPS transport. stream disconnected before completion: websocket closed by server before response.completed';
+  const state = setup([[error('Reconnecting...'), error('Reconnecting...'), error(fallback), message, done]]);
+  await runCodexStream(state.options);
+  assert.equal(state.notices.length, 1);
+  assert.equal(state.calls.length, 1);
+  assert.deepEqual(state.emitted, [message]);
+});
+
+test('a failed HTTPS fallback after tools started never replays the request', async () => {
+  const failure = 'stream disconnected before completion: websocket closed by server before response.completed';
+  const work = { type: 'item.started', item: { type: 'command_execution' } };
+  const state = setup([[work, error(failure), failed(failure), new Error('Codex Exec exited with code 1')]]);
+  await assert.rejects(runCodexStream(state.options), { message: failure });
+  assert.equal(state.calls.length, 1);
+  assert.equal(state.notices.length, 1);
+  assert.deepEqual(state.emitted, [work]);
+});
+
 test('retries failed verification on the same model/thread, preserving image input and cancellation', async () => {
   const state = setup([[{ type: 'thread.started', thread_id: 'created-thread' }, failed(access), new Error('CLI exited 1')], [message, done]]);
   const input = [{ type: 'text', text: 'same request' }, { type: 'local_image', path: '/tmp/example.png' }];

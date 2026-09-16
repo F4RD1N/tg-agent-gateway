@@ -44,3 +44,14 @@ func TestCodexStreamRecovery(t *testing.T) {
 		t.Fatalf("Codex retry regression tests failed:\n%s", out)
 	}
 }
+
+func TestInstallerIncludesWorkerImports(t *testing.T) {
+	installer, err := os.ReadFile("installer.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A fresh installation must include the worker's relative runtime helper.
+	if !strings.Contains(string(installer), "worker.mjs codex-turn.mjs") {
+		t.Fatal("installer omits the Codex recovery runtime module")
+	}
+}

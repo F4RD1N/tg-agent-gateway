@@ -1,0 +1,10 @@
+# Merge into the gateway service user's ~/.codex/config.toml.
+# Keep model_provider at the top level, before any [table] headers.
+# Do not replace existing model, effort, skills, projects, or login settings.
+model_provider = "openai-https"
+
+[model_providers.openai-https]
+name = "OpenAI HTTPS"
+requires_openai_auth = true
+wire_api = "responses"
+supports_websockets = false

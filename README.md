@@ -154,6 +154,12 @@ gateway), `--no-start`, `--uninstall [--purge]`.
 
 ## Using it
 
+If Codex repeatedly reports WebSocket disconnects before falling back to HTTPS,
+see [the transport troubleshooting notes](CODEX_RECOVERY.md#websocket-disconnects).
+The [HTTPS provider example](examples/codex-https.toml) uses the existing OpenAI
+sign-in and model. Apply it to the service user's Codex config; the next CLI
+request reads it without restarting the gateway.
+
 In **General**:
 
 | | |
