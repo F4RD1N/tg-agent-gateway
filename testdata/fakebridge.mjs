@@ -120,6 +120,16 @@ rl.on('line', line => {
     case 'prompt': {
       const sid = m.sid;
       out({ type: 'started', sid, agent: m.agent || 'claude', session: 'sess-' + sid });
+      if (m.text === 'ASK-CHOICES') {
+        out({ type: 'text', sid, text: 'Which test color do you prefer?\n- Blue\n- Green' });
+        out({ type: 'done', sid, session: 'sess-' + sid, subtype: 'success' });
+        return;
+      }
+      if (String(m.text).includes('Answer:')) {
+        out({ type: 'text', sid, text: 'Received input:\n' + m.text });
+        out({ type: 'done', sid, session: 'sess-' + sid, subtype: 'success' });
+        return;
+      }
       if (String(m.text).includes('SLOW')) {
         // Stay running so the test can interrupt it.
         running.set(sid, setTimeout(() => {}, 60000));

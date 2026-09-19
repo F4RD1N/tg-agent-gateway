@@ -48,6 +48,7 @@ type pending struct {
 	owner    int64    // the one person the session belongs to, if it is for somebody else
 	prompt   string   // a message waiting to be queued, applied or dropped
 	images   []string // and whatever came attached to it
+	form     *questionForm
 	expires  time.Time
 }
 
@@ -399,10 +400,20 @@ func (gw *Gateway) submit(sess *Session, text string) {
 }
 
 func (gw *Gateway) submitPrompt(sess *Session, text string, images []string) {
+	gw.submitPromptOrQueue(sess, text, images, false)
+}
+
+func (gw *Gateway) submitPromptOrQueue(sess *Session, text string, images []string, answer bool) {
 	// Check and claim under one lock: two uploads landing together would
 	// otherwise both pass the check and start a turn each.
 	gw.mu.Lock()
 	busy := gw.running[sess.ThreadID]
+	if busy && answer {
+		gw.queued[sess.ThreadID] = append(gw.queued[sess.ThreadID], pendingPrompt{text: text, images: images, at: time.Now()})
+		gw.mu.Unlock()
+		gw.reply(sess.ThreadID, "Answer queued for when the current turn finishes.", nil)
+		return
+	}
 	if !busy && gw.bridge.Alive() {
 		gw.running[sess.ThreadID] = true
 	}
@@ -416,6 +427,9 @@ func (gw *Gateway) submitPrompt(sess *Session, text string, images []string) {
 	if !gw.bridge.Alive() {
 		gw.reply(sess.ThreadID, "The agent bridge is restarting. Try again in a moment.", nil)
 		return
+	}
+	if !answer {
+		gw.clearAgentQuestions(sess.ThreadID)
 	}
 	// The Turn belongs to its pump goroutine and is never shared: everything
 	// else asks gw.running whether a topic is busy.
@@ -522,6 +536,10 @@ func (gw *Gateway) pump(sess *Session, turn *Turn, text string, images []string)
 				turn.AddText(ev.Text)
 				turn.Flush(false)
 			case "text":
+				if gw.offerAgentQuestions(sess, ev.Text) {
+					turn.seal()
+					continue
+				}
 				turn.AddText(ev.Text)
 				turn.Flush(false)
 			case "thinking":

@@ -1589,6 +1589,9 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 	}
 
 	switch head {
+	case "answer":
+		gw.answerAgentQuestion(cq, thread, arg, sess)
+
 	case "dismiss":
 		ack("")
 		_ = gw.tg.Edit(gw.ctx, gw.cfg.ChatID, msgID, "<i>cancelled</i>", nil)

@@ -93,6 +93,12 @@ does kill everything that session started.
   itself keeps them - so conversations that were never started here are
   listed too. Open one for a summary (what it was about, its id, its folder,
   how long ago) and a button that resumes it in a new topic.
+- **Codex answer buttons.** A short question followed by 2–6 bullet or numbered
+  options becomes a Telegram inline keyboard. Tap a choice to send its full text
+  to that conversation; up to three questions are collected before sending.
+  Answers selected while a turn is running queue automatically. You can still
+  type a custom reply. Old, repeated, foreign-topic and unauthorized taps cannot
+  submit an answer. Ordinary lists, quoted text and code do not become buttons.
 - **Isolated sessions.** Instead of picking a folder, pick **Isolated
   sandbox**: the session gets a folder of its own under `/root/isolated` and
   sees nothing else of the machine. No other projects, no memories, no
@@ -264,6 +270,15 @@ the titles are visible to all. Keep genuinely separate work in a separate
 group.
 
 ## Development
+
+The installed [Codex SDK](https://developers.openai.com/codex/sdk/) uses
+`codex exec` JSONL. A live transport probe confirmed that
+`request_user_input_async` currently arrives as a completed `agent_message`
+containing a question and bullet options, without its structured question data.
+`questions.go` recognizes that narrow format in Codex text events and sends
+selections as ordinary conversation input. This is not an App Server tool-result
+response or mid-turn steering; the [App Server protocol](https://developers.openai.com/codex/app-server/)
+provides those separately. Questions without recognizable choices remain text.
 
 ```bash
 go test ./...                                  # fake Telegram + fake bridge, no network
