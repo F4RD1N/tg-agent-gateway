@@ -43,7 +43,7 @@ Each topic in this group is one agent session. Write a message in a topic and it
 /verbose — show tool output and thinking
 
 <b>Isolated sessions</b>
-A sandbox session works in a folder of its own and sees nothing else of this server: no other projects, no memories, no settings. Pick <b>Isolated sandbox</b> instead of a folder when starting one, and say whether it is for you or for somebody else. A session made for somebody else answers only them.
+A sandbox session works in a folder of its own and sees nothing else of this server: no other projects, no memories, no settings. Pick <b>Isolated sandbox</b> instead of a folder when starting one, and say whether it is for you or for somebody else. A session made for somebody else answers them and the gateway administrators.
 /services — what that session keeps running (there is no systemd inside; use <code>svc</code>)
 
 Write while the agent is working and I ask what to do with it: queue it, stop the turn and run it now, or forget it. A queue can hold as many messages as you like.
@@ -842,8 +842,8 @@ func (gw *Gateway) askTopicName(thread, editMsg int, agent, cwd string, iso ...*
 
 // askWhoFor is the question that decides what an isolated session is for. A
 // sandbox kept for yourself behaves like any other topic. One made for
-// somebody else belongs to them alone: they are the only person the bot will
-// answer in it, and the folder is all they can see of this machine.
+// somebody else answers its owner and the administrators; the folder is all
+// the session can see of this machine.
 func (gw *Gateway) askWhoFor(thread, editMsg int, agent string) {
 	menu := &pending{kind: "isoowner", agent: agent, threadID: thread, isolated: true}
 	kb := Rows(
@@ -870,7 +870,7 @@ func (gw *Gateway) askWhoFor(thread, editMsg int, agent string) {
 func (gw *Gateway) askGuestID(thread, editMsg int, agent string, userID int64) {
 	gw.awaitPath(userID, &pending{kind: "isoguest", agent: agent, threadID: thread, isolated: true})
 	text := "Send me the <b>Telegram user id</b> of the person this session is for.\n\n" +
-		"They will be the only one who can use that topic — you included. " +
+		"They and the gateway administrators will be able to use that topic. " +
 		"Ask them to send <code>/id</code> here if they do not know theirs."
 	gw.notify(thread, editMsg, text, Rows([]Button{{Text: "Cancel", CallbackData: "dismiss"}}))
 }
@@ -902,7 +902,7 @@ func (gw *Gateway) startIsolated(thread int, agent, name string, owner int64, ed
 		"📁 <code>" + html.EscapeString(dir) + "</code>\n" +
 		"<i>seen from inside as /workspace</i>"
 	if owner != 0 {
-		text += "\n👤 for <code>" + strconv.FormatInt(owner, 10) + "</code> only"
+		text += "\n👤 for <code>" + strconv.FormatInt(owner, 10) + "</code> · administrators also have access"
 	}
 	gw.notify(thread, editMsg, text, Rows([]Button{{Text: "➡️ Open the topic", URL: link}}))
 
@@ -925,7 +925,7 @@ func isolatedWelcome(owner int64) string {
 		"if the session restarts. Ports it opens are reachable from outside.\n\n" +
 		"Send a file back with <code>tg-send &lt;path&gt;</code> and it arrives in this topic."
 	if owner != 0 {
-		s += "\n\nThis topic is yours alone."
+		s += "\n\nThis topic is assigned to you. Gateway administrators can also use and manage it."
 	}
 	return s
 }

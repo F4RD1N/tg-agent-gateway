@@ -245,10 +245,12 @@ func (gw *Gateway) authorised(user *TGUser, chatID int64, thread int) bool {
 	if user == nil || chatID != gw.cfg.ChatID {
 		return false
 	}
+	if gw.cfg.IsAdmin(user.ID) {
+		return true
+	}
 	sess := gw.store.Get(thread)
 	if sess != nil && sess.OwnerID != 0 {
-		// A session with an owner is that person's alone, admins included.
-		// It is the whole point of handing somebody a sandbox.
+		// Administrators manage every topic; other users need to own it.
 		return user.ID == sess.OwnerID
 	}
 	return gw.cfg.UserAllowed(user.ID)
@@ -700,7 +702,7 @@ func (gw *Gateway) sessionHeader(sess *Session) string {
 	}
 	s := fmt.Sprintf("<b>%s</b>\n📁 <code>%s</code>\n🧠 %s", name, html.EscapeString(guestPath(sess, sess.Cwd)), html.EscapeString(model))
 	if sess.OwnerID != 0 {
-		s += fmt.Sprintf("\n👤 <code>%d</code> only", sess.OwnerID)
+		s += fmt.Sprintf("\n👤 <code>%d</code> · administrators also have access", sess.OwnerID)
 	}
 	if sess.Effort != "" {
 		s += " · ⚡" + html.EscapeString(sess.Effort)

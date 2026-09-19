@@ -169,11 +169,14 @@ func (c *Config) UserAllowed(id int64) bool {
 }
 
 // IsAdmin reports whether this user runs the gateway rather than being a
-// guest in one topic of it. With no admin list configured, everyone the bot
-// answers is an admin.
+// guest in one topic of it. With no admin list configured, every allowed
+// user is an admin. Explicit administrators must also be in the allowlist.
 func (c *Config) IsAdmin(id int64) bool {
+	if !c.UserAllowed(id) {
+		return false
+	}
 	if len(c.AdminUserIDs) == 0 {
-		return c.UserAllowed(id)
+		return true
 	}
 	for _, u := range c.AdminUserIDs {
 		if u == id {

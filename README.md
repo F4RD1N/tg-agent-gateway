@@ -102,8 +102,9 @@ does kill everything that session started.
   package tools, the network, and root inside its own namespace. It cannot
   mount a disk, load a module, see another process or touch the services
   running outside. The bot asks who the sandbox is for; answer *someone else*
-  and give their Telegram id, and that topic answers only them - the admins
-  included.
+  and give their Telegram id, and that topic answers them and the gateway
+  administrators. Administrators can use every session, including its settings,
+  stop/kill controls and end/close/delete buttons.
 - **Services instead of systemd.** There is no init inside a sandbox, so a
   website started from a chat message would die with the turn. `svc` is the
   stand-in: `svc start web npm run dev`, then `svc list`, `svc log web`,
@@ -209,7 +210,7 @@ own commands work too.
 | `bot_token` | from BotFather; treat it as root on this machine |
 | `chat_id` | the forum supergroup |
 | `allowed_user_ids` | who may use it; everyone else is ignored silently |
-| `admin_user_ids` | of those, who may browse and start sessions (default: all of them) |
+| `admin_user_ids` | of those, who has full gateway access, including sessions assigned to someone else (default: all allowed users) |
 | `isolated_root` | where sandboxed sessions get their folders (`/root/isolated`) |
 | `default_cwd` | folder offered for new sessions |
 | `workspace_roots` | sessions and file transfers may not leave these |
@@ -247,7 +248,9 @@ need, and the process, IPC and hostname namespaces are its own. `/run`,
 `/get`, `/ls` and `/cd` in such a topic are confined to that folder too, and
 the sandbox is never handed the bot token: files come back through the
 session's outbox, which the gateway posts into the topic. A session made for
-somebody else answers that Telegram id and nobody else.
+somebody else answers that Telegram id and gateway administrators. Other users
+cannot act in it. Administrator access does not change the session's filesystem
+sandbox.
 
 Two things it deliberately keeps: the network, and each agent's own login
 credential, without which no agent can run at all. So an isolated session can

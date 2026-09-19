@@ -185,36 +185,144 @@ func TestIsolatedSessionIsMadeForOnePerson(t *testing.T) {
 	}
 }
 
-func TestOwnedSessionAnswersOnlyItsOwner(t *testing.T) {
-	gw, _, work := newTestGateway(t)
-	sess, err := gw.createSession("claude", work, "Guest", 0)
-	if err != nil {
-		t.Fatal(err)
+func TestOwnedSessionAccess(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		name := "default-admins"
+		if explicit {
+			name = "explicit-admins"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.ChatID = -100123
+			cfg.AllowedUserIDs = []int64{352188296, 42}
+			if explicit {
+				// An entry in admin_user_ids alone must not bypass the allowlist.
+				cfg.AdminUserIDs = []int64{352188296, 999}
+			}
+			store, err := OpenStore(filepath.Join(t.TempDir(), "state.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			store.Put(&Session{ThreadID: 12, OwnerID: 777})
+			store.Put(&Session{ThreadID: 13, OwnerID: 888})
+			gw := &Gateway{cfg: cfg, store: store}
+			cases := []struct {
+				name   string
+				user   *TGUser
+				chat   int64
+				thread int
+				want   bool
+			}{
+				{"admin-owned-topic", &TGUser{ID: 352188296}, cfg.ChatID, 12, true},
+				{"admin-other-topic", &TGUser{ID: 352188296}, cfg.ChatID, 13, true},
+				{"admin-General", &TGUser{ID: 352188296}, cfg.ChatID, 0, true},
+				{"owner-own-topic", &TGUser{ID: 777}, cfg.ChatID, 12, true},
+				{"owner-other-topic", &TGUser{ID: 777}, cfg.ChatID, 13, false},
+				{"owner-General", &TGUser{ID: 777}, cfg.ChatID, 0, false},
+				{"allowed-user-owned-topic", &TGUser{ID: 42}, cfg.ChatID, 12, !explicit},
+				{"stranger-owned-topic", &TGUser{ID: 999}, cfg.ChatID, 12, false},
+				{"stranger-General", &TGUser{ID: 999}, cfg.ChatID, 0, false},
+				{"admin-wrong-chat", &TGUser{ID: 352188296}, cfg.ChatID - 1, 12, false},
+				{"owner-wrong-chat", &TGUser{ID: 777}, cfg.ChatID - 1, 12, false},
+				{"missing-sender", nil, cfg.ChatID, 12, false},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					if got := gw.authorised(tc.user, tc.chat, tc.thread); got != tc.want {
+						t.Fatalf("authorised = %v, want %v", got, tc.want)
+					}
+				})
+			}
+			if !gw.mayList(352188296) || gw.mayList(777) || gw.mayList(999) {
+				t.Fatal("only allowed administrators may manage the gateway")
+			}
+		})
 	}
-	gw.store.Update(sess.ThreadID, func(s *Session) { s.OwnerID = 777 })
-	thread := sess.ThreadID
+}
 
-	owner := &TGUser{ID: 777}
-	admin := &TGUser{ID: 42}
+func TestAdminCanEndAnotherUsersSession(t *testing.T) {
+	for _, mode := range []string{"close", "delete", "keep"} {
+		t.Run(mode, func(t *testing.T) {
+			gw, f, work := newTestGateway(t)
+			gw.cfg.AllowedUserIDs = []int64{352188296}
+			gw.cfg.AdminUserIDs = []int64{352188296}
+			const thread = 12
+			gw.store.Put(&Session{ThreadID: thread, Agent: "claude", Cwd: work,
+				OwnerID: 777, Isolated: true, Root: work, Ref: "guest-conversation"})
 
-	if !gw.authorised(owner, gw.cfg.ChatID, thread) {
-		t.Fatal("the person the session was made for must be able to use it")
+			u := msg(thread, "/end")
+			u.Message.From.ID = 352188296
+			gw.handleUpdate(u)
+			menu := f.waitFor(t, "sendMessage", "End this session", 3*time.Second)
+			if !has(buttons(menu), "end:"+mode) {
+				t.Fatal("administrator should receive all end-session choices")
+			}
+			click := press(thread, menu.ID, "end:"+mode)
+			click.CallbackQuery.From.ID = 352188296
+			gw.handleUpdate(click)
+			method := "deleteForumTopic"
+			if mode == "close" {
+				method = "closeForumTopic"
+			}
+			f.waitFor(t, method, "", 3*time.Second)
+			if gw.store.Get(thread) != nil {
+				t.Fatal("administrator must be able to end another user's session")
+			}
+			if mode == "keep" {
+				kept := gw.store.Kept()
+				if len(kept) != 1 || kept[0].OwnerID != 777 || kept[0].Ref != "guest-conversation" || !kept[0].Isolated {
+					t.Fatal("keeping a guest session must preserve its owner, conversation and sandbox")
+				}
+			}
+		})
 	}
-	if gw.authorised(admin, gw.cfg.ChatID, thread) {
-		t.Fatal("an owned session is that person's alone, admins included")
+}
+
+func TestAdminCanUseAndConfigureAnotherUsersSession(t *testing.T) {
+	gw, f, work := newTestGateway(t)
+	gw.cfg.AllowedUserIDs = []int64{352188296}
+	const thread = 12
+	gw.store.Put(&Session{ThreadID: thread, Agent: "claude", Cwd: work,
+		OwnerID: 777, Isolated: true, Root: work})
+
+	u := msg(thread, "say hello")
+	u.Message.From.ID = 352188296
+	gw.handleUpdate(u)
+	f.waitForAny(t, []string{"sendMessage", "editMessageText"}, "Hello", 5*time.Second)
+
+	click := press(thread, 1001, "cf:perm:plan")
+	click.CallbackQuery.From.ID = 352188296
+	gw.handleUpdate(click)
+	sess := gw.store.Get(thread)
+	if sess.PermMode != "plan" || sess.OwnerID != 777 || !sess.Isolated || sess.Root != work {
+		t.Fatalf("admin settings change must preserve ownership and sandbox: %+v", sess)
 	}
-	// Everywhere else, the guest is nobody.
-	if gw.authorised(owner, gw.cfg.ChatID, 0) {
-		t.Fatal("a guest must not be answered in General")
-	}
-	if !gw.authorised(admin, gw.cfg.ChatID, 0) {
-		t.Fatal("an admin still runs the gateway")
-	}
-	if gw.mayList(777) {
-		t.Fatal("a guest must not be able to browse the sessions")
-	}
-	if !gw.mayList(42) {
-		t.Fatal("an admin browses the sessions")
+}
+
+func TestNonAdminsCannotEndOwnedSessions(t *testing.T) {
+	for _, user := range []int64{777, 42, 999} {
+		gw, f, work := newTestGateway(t)
+		gw.cfg.AllowedUserIDs = []int64{352188296, 42}
+		gw.cfg.AdminUserIDs = []int64{352188296}
+		const thread = 12
+		gw.store.Put(&Session{ThreadID: thread, Agent: "claude", Cwd: work, OwnerID: 777})
+		before := f.count()
+		u := msg(thread, "/end")
+		u.Message.From.ID = user
+		gw.handleUpdate(u)
+		for _, data := range []string{"end", "end:close", "end:delete", "end:keep"} {
+			click := press(thread, 1001, data)
+			click.CallbackQuery.From.ID = user
+			gw.handleUpdate(click)
+		}
+		if gw.store.Get(thread) == nil || len(gw.store.Kept()) != 0 {
+			t.Fatalf("non-admin %d changed the session", user)
+		}
+		for _, call := range f.since(before) {
+			if call.Method == "closeForumTopic" || call.Method == "deleteForumTopic" || strings.Contains(text(&call), "End this session") {
+				t.Fatalf("non-admin %d reached end-session controls", user)
+			}
+		}
 	}
 }
 

@@ -30,8 +30,8 @@ type Session struct {
 	Isolated bool   `json:"isolated,omitempty"`
 	Root     string `json:"root,omitempty"`
 	// OwnerID, when set, is the one Telegram user this session belongs to.
-	// Nobody else may use the topic - not the other allowed users, and not
-	// the admins either. It is how a sandbox is handed to somebody.
+	// Administrators can also use and manage it. Other users cannot, even
+	// when they appear in the allowed list.
 	OwnerID int64 `json:"owner_id,omitempty"`
 
 	// Config, as offered by the Config button. Empty or zero means "leave the
