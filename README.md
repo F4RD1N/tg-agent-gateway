@@ -36,6 +36,13 @@ does kill everything that session started.
   abandoned one's work, so the topic carries on. `/session` shows a topic's
   conversation id and `/resume <id>` points a topic at any conversation, which
   is the manual way back.
+- **Load by UUID.** Send `/claude <uuid>`, `/codex <uuid>` or `/agy <uuid>`
+  in General or any topic. The bot finds the session on this server, asks for
+  a topic name, then opens it with that name. If already open, its existing
+  topic is renamed and linked; otherwise a new topic is created. Older local
+  history and kept sessions work too; kept settings, ownership and sandbox
+  folders are preserved. Send `/cancel` or tap Cancel to abandon naming.
+  These commands are for gateway administrators.
 - **Skills and plugins.** `/skills` lists what the agent can be told to run by
   name — Claude's skills, plugin skills and slash commands, Antigravity's
   skills, Codex's prompt files — and runs it on a tap, asking for arguments
@@ -175,6 +182,7 @@ In **General**:
 | `/new My Project` | same, with that topic name |
 | `/new codex /root/app` | skip straight to a session |
 | `/sessions` | browse past conversations and resume one |
+| `/claude <uuid>` `/codex <uuid>` `/agy <uuid>` | find a session, ask for its topic name, then open it |
 | `/help` `/id` | |
 
 In a **topic**:

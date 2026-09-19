@@ -20,7 +20,7 @@ import path from 'node:path';
 import { spawn, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import { listHistory } from './history.mjs';
+import { listHistory, findHistory } from './history.mjs';
 import { listWorkflows, workflowDetail } from './workflows.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -547,7 +547,9 @@ function handle(msg) {
       pendingWork++;
       const agent = agentOf(msg.agent);
       Promise.resolve()
-        .then(() => listHistory(agent, msg.roots || [], msg.limit || 10))
+        .then(() => msg.resume
+          ? findHistory(agent, msg.roots || [], msg.resume)
+          : listHistory(agent, msg.roots || [], msg.limit || 10))
         .then(sessions => out({ type: 'history', sid: msg.sid || '', agent, sessions }))
         .catch(err => out({ type: 'error', sid: msg.sid || '', message: 'history: ' + String(err?.message || err) }))
         .finally(() => { pendingWork--; });

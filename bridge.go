@@ -137,7 +137,8 @@ type Command struct {
 	// set the worker runs inside a sandbox built around that folder, and Cwd
 	// is the path as seen from in there.
 	SandboxDir string `json:"sandbox_dir,omitempty"`
-	// Roots and Limit belong to the history command; RunID to the workflow one.
+	// Roots and Limit belong to history; Resume selects an exact history UUID.
+	// RunID belongs to the workflow command.
 	Roots []string `json:"roots,omitempty"`
 	Limit int      `json:"limit,omitempty"`
 	RunID string   `json:"run_id,omitempty"`

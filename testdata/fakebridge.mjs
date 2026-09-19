@@ -41,6 +41,17 @@ rl.on('line', line => {
     }
     case 'history': {
       const agent = m.agent || 'claude';
+      if (m.resume) {
+        if (m.resume.endsWith('000000000003')) {
+          out({ type: 'error', sid: m.sid, message: 'history unavailable' });
+          break;
+        }
+        const sessions = m.resume.endsWith('000000000001') || m.resume.endsWith('000000000002')
+          ? [{ id: m.resume, preview: 'A saved conversation', cwd: '/tmp', isolated: false }]
+          : [];
+        out({ type: 'history', sid: m.sid, agent, sessions });
+        break;
+      }
       const sessions = [];
       for (let i = 0; i < (m.limit || 10); i++) {
         sessions.push({
@@ -119,6 +130,12 @@ rl.on('line', line => {
     }
     case 'prompt': {
       const sid = m.sid;
+      if (String(m.text).includes('VERIFY-RESUME')) {
+        out({ type: 'started', sid, agent: m.agent, session: m.resume });
+        out({ type: 'text', sid, text: 'Resume received: ' + JSON.stringify({ agent: m.agent, resume: m.resume, cwd: m.cwd }) });
+        out({ type: 'done', sid, session: m.resume, subtype: 'success' });
+        return;
+      }
       out({ type: 'started', sid, agent: m.agent || 'claude', session: 'sess-' + sid });
       if (m.text === 'ASK-CHOICES') {
         out({ type: 'text', sid, text: 'Which test color do you prefer?\n- Blue\n- Green' });

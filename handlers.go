@@ -20,6 +20,7 @@ Each topic in this group is one agent session. Write a message in a topic and it
 /new My Project — name the topic yourself
 /rename &lt;name&gt; — rename this topic
 /sessions — browse past conversations and take one up again
+/claude &lt;uuid&gt; /codex &lt;uuid&gt; /agy &lt;uuid&gt; — find a session, then choose its topic name
 /end — close the topic, or delete it and keep the session
 
 <b>This topic</b>
@@ -55,6 +56,7 @@ Send a file to a topic and it lands in that session's folder. Anything else star
 // sandbox has none of them.
 var adminCommands = map[string]bool{
 	"new": true, "sessions": true, "list": true, "end": true, "resume": true, "attach": true,
+	"claude": true, "codex": true, "agy": true,
 }
 
 func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
@@ -77,6 +79,8 @@ func (gw *Gateway) handleCommand(m *TGMessage, thread int, text string) {
 		gw.cmdNew(thread, arg)
 	case "sessions", "list":
 		gw.cmdSessions(thread)
+	case "claude", "codex", "agy":
+		gw.cmdLoadSession(m.From.ID, thread, cmd, arg)
 	case "session", "id-session":
 		gw.needSession(thread, sess, func(s *Session) {
 			id := s.Ref
@@ -1251,7 +1255,7 @@ func (gw *Gateway) showPastSessions(thread, editMsg int, agent string) {
 				[]Button{{Text: "⬅️ Back", CallbackData: "sessions"}}))
 			return
 		}
-		open := gw.openByRef()
+		open := gw.openByRef(agent)
 		var buttons []Button
 		for i, p := range past {
 			mark := "💬"
@@ -1317,10 +1321,10 @@ func (gw *Gateway) withKept(agent string, past []PastSession) []PastSession {
 }
 
 // openByRef maps a conversation id to the topic that is running it.
-func (gw *Gateway) openByRef() map[string]int {
+func (gw *Gateway) openByRef(agent string) map[string]int {
 	out := map[string]int{}
 	for _, s := range gw.store.List() {
-		if s.Ref != "" {
+		if s.Agent == agent && s.Ref != "" {
 			out[s.Ref] = s.ThreadID
 		}
 	}
@@ -1357,7 +1361,7 @@ func (gw *Gateway) showPastSession(thread, editMsg int, agent string, p PastSess
 	}
 
 	rows := [][]Button{}
-	if topic := gw.openByRef()[p.ID]; topic != 0 {
+	if topic := gw.openByRef(agent)[p.ID]; topic != 0 {
 		b.WriteString("\n\n<i>this conversation is open in a topic</i>")
 		rows = append(rows, []Button{{Text: "➡️ Open the topic", URL: TopicLink(gw.cfg.ChatID, topic)}})
 	}
@@ -1375,7 +1379,7 @@ func (gw *Gateway) resumePast(thread, editMsg int, agent string, p PastSession) 
 	if p.Name != "" {
 		name = p.Name
 	}
-	if name == "" || strings.HasPrefix(name, "(") {
+	if name == "" || (p.Name == "" && strings.HasPrefix(name, "(")) {
 		name = "Resumed"
 	}
 	// A session that was kept when its topic went comes back as it was, with
@@ -1384,12 +1388,23 @@ func (gw *Gateway) resumePast(thread, editMsg int, agent string, p PastSession) 
 	if p.Kept != "" {
 		restored = gw.store.TakeKept(p.Kept)
 	}
+	// Failed validation or topic creation must leave the archive intact.
+	restoredOK := false
+	defer func() {
+		if restored != nil && !restoredOK {
+			gw.store.PutKept(p.Kept, restored)
+		}
+	}()
 	var sess *Session
 	var err error
 	if p.Isolated {
 		// Its folder is still there; the sandbox is rebuilt around it.
 		dir := p.Cwd
-		if dir == "" || !within(gw.isolatedRoot(), dir) {
+		if restored != nil && restored.Root != "" {
+			dir = restored.Root
+		}
+		st, statErr := os.Stat(dir)
+		if dir == "" || !within(gw.isolatedRoot(), dir) || statErr != nil || !st.IsDir() {
 			gw.notify(thread, editMsg, "That isolated session's folder is gone, so it cannot be resumed.")
 			return
 		}
@@ -1405,10 +1420,6 @@ func (gw *Gateway) resumePast(thread, editMsg int, agent string, p PastSession) 
 		sess, err = gw.createSession(agent, dir, name, 0)
 	}
 	if err != nil {
-		if restored != nil {
-			// Put it back rather than losing it to a failed topic creation.
-			gw.store.PutKept(p.Kept, restored)
-		}
 		gw.notify(thread, editMsg, "⚠️ "+html.EscapeString(err.Error()))
 		return
 	}
@@ -1417,14 +1428,21 @@ func (gw *Gateway) resumePast(thread, editMsg int, agent string, p PastSession) 
 			thread, title, cwd, root := s.ThreadID, s.Title, s.Cwd, s.Root
 			*s = *restored
 			s.ThreadID, s.Title, s.Cwd, s.Root = thread, title, cwd, root
+			if s.Isolated && within(root, restored.Cwd) {
+				if st, e := os.Stat(restored.Cwd); e == nil && st.IsDir() {
+					s.Cwd = restored.Cwd
+				}
+			}
 			s.DetachedAt = time.Time{}
 		}
+		s.Name, s.AutoName = name, false
 		s.Ref = p.ID
 		s.LastUsed = time.Now()
 	})
 	if ns == nil {
 		return
 	}
+	restoredOK = true
 	_ = gw.bridge.Send(gw.command("start", ns, ""))
 
 	gw.notify(thread, editMsg, "▶️ resumed <code>"+html.EscapeString(p.ID)+"</code> in a new topic.",
@@ -1589,6 +1607,9 @@ func (gw *Gateway) handleCallback(cq *TGCallbackQuery) {
 	}
 
 	switch head {
+	case "loadcancel":
+		gw.cancelSessionLoad(cq, thread, arg)
+		return
 	case "answer":
 		gw.answerAgentQuestion(cq, thread, arg, sess)
 

@@ -101,7 +101,7 @@ function homes(roots) {
 
 // ---------------------------------------------------------------- claude
 
-function claudeHistory(roots, limit) {
+function claudeHistory(roots, limit, id = '') {
   const found = [];
   for (const place of homes(roots)) {
     const base = path.join(place.home, '.claude', 'projects');
@@ -109,6 +109,7 @@ function claudeHistory(roots, limit) {
       if (!project.isDirectory()) continue;
       for (const f of listDir(path.join(base, project.name))) {
         if (!f.isFile() || !f.name.endsWith('.jsonl')) continue;
+        if (id && f.name.toLowerCase() !== id + '.jsonl') continue;
         const file = path.join(base, project.name, f.name);
         const st = statOf(file);
         if (!st || st.size === 0) continue;
@@ -159,7 +160,7 @@ function claudeSession(hit) {
 
 // ---------------------------------------------------------------- codex
 
-function codexHistory(roots, limit) {
+function codexHistory(roots, limit, id = '') {
   const found = [];
   for (const place of homes(roots)) {
     const base = path.join(place.home, '.codex', 'sessions');
@@ -169,6 +170,10 @@ function codexHistory(roots, limit) {
         for (const day of descend(month)) {
           for (const f of listDir(day)) {
             if (!f.isFile() || !f.name.endsWith('.jsonl')) continue;
+            // Standard rollout filenames carry the UUID. Older/custom names
+            // are checked through their session_meta record below.
+            const fileID = f.name.match(/([0-9a-f-]{36})\.jsonl$/i)?.[1];
+            if (id && fileID && fileID.toLowerCase() !== id) continue;
             const file = path.join(day, f.name);
             const st = statOf(file);
             if (!st || st.size === 0) continue;
@@ -187,6 +192,7 @@ function codexHistory(roots, limit) {
   for (const hit of found) {
     if (out.length >= limit) break;
     const s = codexSession(hit);
+    if (id && s?.id.toLowerCase() !== id) continue;
     if (!s || seen.has(s.id)) continue;
     seen.add(s.id);
     out.push(s);
@@ -248,12 +254,13 @@ function codexSession(hit) {
 
 // ------------------------------------------------------------ antigravity
 
-function agyHistory(roots, limit) {
+function agyHistory(roots, limit, id = '') {
   const found = [];
   for (const place of homes(roots)) {
     const base = path.join(place.home, '.gemini', 'antigravity-cli', 'conversations');
     for (const f of listDir(base)) {
       if (!f.isFile() || !f.name.endsWith('.db')) continue;
+      if (id && f.name.toLowerCase() !== id + '.db') continue;
       const file = path.join(base, f.name);
       const st = statOf(file);
       if (!st || st.size === 0) continue;
@@ -362,5 +369,20 @@ export function listHistory(agent, roots, limit = 10) {
     case 'codex': return codexHistory(roots, n);
     case 'antigravity': return agyHistory(roots, n);
     default: return claudeHistory(roots, n);
+  }
+}
+
+// Exact lookup has no age/count cutoff and reads only matching transcripts
+// when the agent's filename includes its UUID. It never creates a session.
+export function findHistory(agent, roots, uuid) {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(uuid)) {
+    throw new Error('invalid conversation UUID');
+  }
+  const id = uuid.toLowerCase();
+  switch (agent) {
+    case 'claude': return claudeHistory(roots, 1, id);
+    case 'codex': return codexHistory(roots, 1, id);
+    case 'antigravity': return agyHistory(roots, 1, id);
+    default: throw new Error('unknown agent');
   }
 }

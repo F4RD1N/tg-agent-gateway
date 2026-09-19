@@ -71,6 +71,7 @@ type Gateway struct {
 	me     *TGUser
 
 	mu       sync.Mutex
+	resumeMu sync.Mutex // serializes UUID topic creation after naming
 	running  map[int]bool
 	menus    map[int]*pending
 	awaitTP  map[int64]*pending // user id -> "send me a path" state
@@ -286,6 +287,9 @@ func (gw *Gateway) handleMessage(m *TGMessage) {
 		return
 	}
 	thread := messageThread // 0 is General
+	if gw.handleSessionLoadInput(m, thread) {
+		return
+	}
 
 	// A path we asked the user to type.
 	if p := gw.takeAwaited(m.From.ID); p != nil && m.Text != "" && !strings.HasPrefix(m.Text, "/") {
@@ -1103,6 +1107,9 @@ func (gw *Gateway) takeAwaited(userID int64) *pending {
 	if p == nil {
 		return nil
 	}
+	if p.kind == "loadlookup" || p.kind == "loadname" {
+		return nil // handled separately, only in the topic that asked
+	}
 	delete(gw.awaitTP, userID)
 	if time.Now().After(p.expires) {
 		return nil
@@ -1272,6 +1279,11 @@ func (gw *Gateway) fetchSkills(agent string) ([]SkillInfo, error) {
 // read fresh every time: somebody browsing their sessions has just been
 // working in one of them.
 func (gw *Gateway) fetchHistory(agent string) ([]PastSession, error) {
+	return gw.fetchHistoryID(agent, "")
+}
+
+// A nonempty id requests an exact lookup, without the recent-history limit.
+func (gw *Gateway) fetchHistoryID(agent, id string) ([]PastSession, error) {
 	gw.mu.Lock()
 	gw.reqSeq++
 	sid := "history-" + agent + "-" + strconv.FormatInt(gw.reqSeq, 10)
@@ -1279,7 +1291,7 @@ func (gw *Gateway) fetchHistory(agent string) ([]PastSession, error) {
 
 	ch := gw.bridge.Subscribe(sid)
 	defer gw.bridge.Unsubscribe(sid, ch)
-	cmd := Command{Type: "history", SID: sid, Agent: agent, Limit: pastPerAgent}
+	cmd := Command{Type: "history", SID: sid, Agent: agent, Limit: pastPerAgent, Resume: id}
 	if root := gw.isolatedRoot(); root != "" {
 		cmd.Roots = []string{root}
 	}
@@ -1464,6 +1476,9 @@ func botCommands() []BotCommand {
 	return []BotCommand{
 		{"new", "start a session (agent and folder on buttons)"},
 		{"sessions", "browse past conversations and resume one"},
+		{"claude", "load a Claude UUID, then choose a topic name"},
+		{"codex", "load a Codex UUID, then choose a topic name"},
+		{"agy", "load an Antigravity UUID, then choose a topic name"},
 		{"status", "what this session is, with its buttons"},
 		{"model", "pick the model, then its effort level"},
 		{"config", "permissions, thinking, limits, sandbox"},
